@@ -1,0 +1,192 @@
+{
+  "main": {
+    "id": "b460b175bd693b20",
+    "type": "split",
+    "children": [
+      {
+        "id": "72306f6dc4533a8e",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "ee3eae1094caed4e",
+            "type": "leaf",
+            "state": {
+              "type": "empty",
+              "state": {},
+              "icon": "lucide-file",
+              "title": "New tab"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "26e8861534c63af1",
+    "type": "split",
+    "children": [
+      {
+        "id": "5a6e973f8ffa58fa",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "cbb462ff1c4a978d",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "f6e1e212dde9a5fd",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "1fa9ae33678af9c0",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "96f0882a6aeecee7",
+    "type": "split",
+    "children": [
+      {
+        "id": "e0b6e5f16f6d1995",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "fd5e2b7f55b5c524",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "phase0-2-threadx-integration-requirements.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for phase0-2-threadx-integration-requirements"
+            }
+          },
+          {
+            "id": "943725eac4153dd1",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "phase0-2-threadx-integration-requirements.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from phase0-2-threadx-integration-requirements"
+            }
+          },
+          {
+            "id": "786df6a7cf688a94",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "880fa308980a3516",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "50f000a94d576189",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "phase0-2-threadx-integration-requirements.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of phase0-2-threadx-integration-requirements"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "cbb462ff1c4a978d",
+  "lastOpenFiles": [
+    "Untitled",
+    "phase0-1-esp-hal-deep-dive.md",
+    "phase0-4-esp32c6-specifics.md",
+    "phase0-3-wifi-bt-stack-analysis.md",
+    "phase0-4-esp32c6-specifics.md.tmp.886584.1771294207119",
+    "phase0-2-threadx-integration-requirements.md",
+    "phase0-3-wifi-bt-stack-analysis.md.tmp.886584.1771294087980"
+  ]
+}

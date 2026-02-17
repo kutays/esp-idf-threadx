@@ -1,0 +1,30 @@
+menu "ThreadX Configuration"
+
+    config THREADX_TICK_RATE_HZ
+        int "ThreadX tick rate (Hz)"
+        default 100
+        help
+            Number of ThreadX timer ticks per second.
+
+    config THREADX_MAX_PRIORITIES
+        int "Maximum thread priority levels"
+        default 32
+        help
+            Maximum number of ThreadX priority levels (0 = highest).
+
+    config THREADX_BYTE_POOL_SIZE
+        int "System byte pool size (bytes)"
+        default 32768
+        help
+            Size of the system byte pool used for dynamic allocations
+            including FreeRTOS compatibility layer objects.
+
+    config THREADX_TIMER_CPU_INT
+        int "CPU interrupt number for SYSTIMER"
+        default 7
+        range 1 31
+        help
+            CPU interrupt line to use for the SYSTIMER tick interrupt.
+            Must not conflict with other ESP-IDF interrupt allocations.
+
+endmenu

@@ -1,0 +1,3 @@
+[submodule "components/threadx/threadx"]
+	path = components/threadx/threadx
+	url = https://github.com/eclipse-threadx/threadx.git

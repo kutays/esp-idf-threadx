@@ -1,0 +1,12 @@
+[mapping:threadx]
+archive: libthreadx.a
+entries:
+    # Place ThreadX scheduler and context switch code in IRAM for performance
+    tx_thread_schedule (noflash_text)
+    tx_thread_context_save (noflash_text)
+    tx_thread_context_restore (noflash_text)
+    tx_thread_system_return (noflash_text)
+    tx_initialize_low_level (noflash_text)
+    tx_timer_interrupt (noflash_text)
+    # Timer ISR handler must be in IRAM
+    tx_timer_interrupt_handler (noflash_text)
