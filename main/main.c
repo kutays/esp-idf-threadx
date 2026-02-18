@@ -12,7 +12,7 @@
 static const char *TAG = "main";
 
 /* Second test thread */
-#define BLINK_STACK_SIZE    2048
+#define BLINK_STACK_SIZE    4096
 //#define BLINK_THREAD_PRIO   20
 #define BLINK_THREAD_PRIO   5
 
@@ -59,8 +59,10 @@ void app_main(void)
         ESP_LOGE(TAG, "Thread created: %u", status);
     /* Main thread loop */
     ULONG count = 0;
+    
     while (1) {
         ESP_LOGI(TAG, "[main]  tick=%lu  count=%lu", tx_time_get(), count++);
         tx_thread_sleep(200);  /* ~2 seconds */
     }
+    
 }

@@ -1,17 +1,37 @@
 /*
  * tx_port_startup.c — ESP-IDF to ThreadX bridge
  *
- * This file provides the startup bridge between ESP-IDF's boot sequence
- * and the ThreadX kernel. ESP-IDF calls esp_startup_start_app() after
- * hardware init is complete. We provide a strong symbol that overrides
- * ESP-IDF's weak default (which normally starts the FreeRTOS scheduler).
+ * How we hook into ESP-IDF startup:
  *
- * Flow:
- *   ESP-IDF boot → start_cpu0_default() → esp_startup_start_app()
- *     → [our override] → tx_kernel_enter()
- *       → _tx_initialize_low_level()
- *       → tx_application_define()
- *       → ThreadX scheduler starts
+ *   FreeRTOS's esp_startup_start_app() is a STRONG symbol (not overrideable).
+ *   It does this (from app_startup.c):
+ *
+ *     void esp_startup_start_app(void) {
+ *         esp_int_wdt_init();
+ *         esp_crosscore_int_init();
+ *         xTaskCreatePinnedToCore(main_task, ...);   // creates FreeRTOS main task
+ *         if (port_start_app_hook != NULL)
+ *             port_start_app_hook();                 // ← WEAK hook we override
+ *         vTaskStartScheduler();                     // FreeRTOS scheduler
+ *     }
+ *
+ *   We provide a strong port_start_app_hook() that calls tx_kernel_enter()
+ *   which never returns. vTaskStartScheduler() is therefore never reached.
+ *   ThreadX owns the CPU from this point.
+ *
+ *   The FreeRTOS main_task that was created above never gets to run because
+ *   the FreeRTOS scheduler never starts. Our own main_thread (created in
+ *   tx_application_define) calls app_main() instead.
+ *
+ * Boot flow:
+ *   ESP-IDF boot → esp_startup_start_app()
+ *     → xTaskCreatePinnedToCore(main_task)  [created but never scheduled]
+ *     → port_start_app_hook()               [our override]
+ *       → tx_kernel_enter()                 [never returns]
+ *         → _tx_initialize_low_level()
+ *         → tx_application_define()         [creates our main_thread]
+ *         → ThreadX scheduler starts
+ *           → main_thread runs app_main()
  */
 
 #include "tx_api.h"
@@ -27,7 +47,7 @@ extern void app_main(void);
 static TX_BYTE_POOL system_byte_pool;
 static UCHAR system_byte_pool_storage[SYSTEM_BYTE_POOL_SIZE];
 
-/* Main thread — runs app_main() */
+/* Main thread — wraps app_main() */
 #define MAIN_THREAD_STACK_SIZE  4096
 #define MAIN_THREAD_PRIORITY    16
 static TX_THREAD main_thread;
@@ -42,7 +62,7 @@ static void main_thread_entry(ULONG param)
     ESP_LOGI(TAG, "Main thread started, calling app_main()");
     app_main();
 
-    /* If app_main returns, just suspend this thread */
+    /* If app_main returns, suspend this thread — ThreadX keeps running */
     ESP_LOGW(TAG, "app_main() returned, suspending main thread");
     tx_thread_suspend(tx_thread_identify());
 }
@@ -51,10 +71,7 @@ static void main_thread_entry(ULONG param)
  * tx_application_define
  *
  * Called by ThreadX during tx_kernel_enter(), before the scheduler starts.
- * This is the standard ThreadX hook where we set up system resources
- * and create the main application thread.
- *
- * first_unused_memory: pointer to first free memory after ThreadX data
+ * Set up system resources and create the main application thread.
  */
 void tx_application_define(void *first_unused_memory)
 {
@@ -86,7 +103,7 @@ void tx_application_define(void *first_unused_memory)
         main_thread_stack,
         MAIN_THREAD_STACK_SIZE,
         MAIN_THREAD_PRIORITY,
-        MAIN_THREAD_PRIORITY,    /* preemption threshold = priority (no threshold) */
+        MAIN_THREAD_PRIORITY,
         TX_NO_TIME_SLICE,
         TX_AUTO_START
     );
@@ -99,28 +116,29 @@ void tx_application_define(void *first_unused_memory)
 }
 
 /*
- * esp_startup_start_app
+ * port_start_app_hook
  *
- * Strong symbol override of ESP-IDF's weak default.
- * Called at the end of the ESP-IDF startup sequence.
- * Instead of starting FreeRTOS, we enter the ThreadX kernel.
+ * Weak hook called by FreeRTOS's esp_startup_start_app() just before
+ * vTaskStartScheduler(). By never returning from here, we prevent
+ * FreeRTOS from starting and hand control to ThreadX instead.
+ *
+ * This is the correct interception point — esp_startup_start_app() itself
+ * is a strong symbol in app_startup.c and cannot be overridden.
  */
-void esp_startup_start_app(void)
+void port_start_app_hook(void)
 {
-    ESP_LOGI(TAG, "=== ThreadX taking over from ESP-IDF startup ===");
-    ESP_LOGI(TAG, "Entering ThreadX kernel...");
+    ESP_LOGI(TAG, "=== ThreadX taking over (port_start_app_hook) ===");
+    ESP_LOGI(TAG, "Entering ThreadX kernel — FreeRTOS scheduler will not start");
 
     /*
      * tx_kernel_enter() does not return. It:
-     *   1. Calls _tx_initialize_low_level() — our asm init
-     *   2. Calls tx_application_define() — our function above
-     *   3. Starts the ThreadX scheduler
+     *   1. Calls _tx_initialize_low_level() — installs vector table, sets up timer
+     *   2. Calls tx_application_define()   — creates our main_thread
+     *   3. Starts the ThreadX scheduler    — runs threads forever
      */
     tx_kernel_enter();
 
     /* Should never reach here */
     ESP_LOGE(TAG, "ERROR: tx_kernel_enter() returned!");
-    while (1) {
-        /* spin */
-    }
+    while (1) { }
 }

@@ -5,9 +5,28 @@
  * ThreadX port. It handles:
  *   1. Saving the system stack pointer for ISR use
  *   2. Setting up the first-available-memory pointer
- *   3. Installing the ThreadX trap/exception handler in mtvec
+ *   3. Installing a proper vectored MTVEC table for ESP32-C6
  *   4. Enabling machine external interrupts (mie.MEIE)
  *   5. Calling the C timer setup function for SYSTIMER
+ *
+ * ESP32-C6 MTVEC DISPATCH (BUG FIX):
+ *   The ESP32-C6 CPU ALWAYS uses vectored dispatch regardless of the mtvec
+ *   mode bits. Specifically (from vectors_intc.S comment in ESP-IDF):
+ *
+ *     "CPU only uses the 24 MSBs of the MTVEC, i.e. (MTVEC & 0xffffff00)"
+ *
+ *   Dispatch rules:
+ *     Exception      → jump to (MTVEC & 0xffffff00) + 0      = vector[0]
+ *     Interrupt N    → jump to (MTVEC & 0xffffff00) + N*4    = vector[N]
+ *
+ *   Therefore mtvec MUST point to a 256-byte aligned vector table where
+ *   each entry is a 4-byte jump instruction. Installing a plain function
+ *   address in mtvec DOES NOT WORK — interrupts jump into the middle of
+ *   the handler code rather than the entry point.
+ *
+ *   We use CPU interrupt line 7 for SYSTIMER, so:
+ *     vector[0] → _tx_esp32c6_exception_entry (CPU exception → abort())
+ *     vector[7] → _tx_esp32c6_trap_handler    (SYSTIMER tick)
  *
  * ESP32-C6 uses SOC_INT_PLIC_SUPPORTED. Machine-mode external interrupts
  * are routed through the PLIC at 0x20001000. The mie.MEIE CSR bit (bit 11)
@@ -16,7 +35,6 @@
 
 #include "tx_port.h"
 
-    .section .text
     .global _tx_initialize_low_level
     .global _tx_thread_context_save
     .global _tx_thread_context_restore
@@ -37,12 +55,98 @@
     /* Interrupt stack frame size: 32 registers * REGBYTES (no FP on ESP32-C6) */
     .equ INT_FRAME_SIZE, (32 * REGBYTES)
 
+/* =========================================================================
+ * Vector table
+ *
+ * MUST be 256-byte aligned — ESP32-C6 uses only the top 24 bits of MTVEC.
+ * MUST use 4-byte instructions — .option norvc disables compressed encoding.
+ *
+ * Each entry is a `j` to a handler. The CPU dispatches to vector[N] for
+ * interrupt line N, and to vector[0] for exceptions.
+ *
+ * We place this in .iram0.text so it is always in IRAM (accessible during
+ * interrupts without needing the flash/cache to be active).
+ * ========================================================================= */
+    .section .iram0.text,"ax",@progbits
+    .balign 256
+
+    .option push
+    .option norvc       /* Force 4-byte j instructions — critical for table layout */
+
+    .global _tx_esp32c6_vector_table
+    .type   _tx_esp32c6_vector_table, @function
+_tx_esp32c6_vector_table:
+    j   _tx_esp32c6_exception_entry /* 0: exception entry */
+    j   _tx_esp32c6_unused_int      /* 1: unused CPU interrupt */
+    j   _tx_esp32c6_unused_int      /* 2: unused CPU interrupt */
+    j   _tx_esp32c6_unused_int      /* 3: unused CPU interrupt */
+    j   _tx_esp32c6_unused_int      /* 4: unused CPU interrupt */
+    j   _tx_esp32c6_unused_int      /* 5: unused CPU interrupt */
+    j   _tx_esp32c6_unused_int      /* 6: unused CPU interrupt */
+    j   _tx_esp32c6_trap_handler    /* 7: SYSTIMER tick (CPU interrupt line 7) */
+    j   _tx_esp32c6_unused_int      /* 8: unused */
+    j   _tx_esp32c6_unused_int      /* 9: unused */
+    j   _tx_esp32c6_unused_int      /* 10: unused */
+    j   _tx_esp32c6_unused_int      /* 11: unused */
+    j   _tx_esp32c6_unused_int      /* 12: unused */
+    j   _tx_esp32c6_unused_int      /* 13: unused */
+    j   _tx_esp32c6_unused_int      /* 14: unused */
+    j   _tx_esp32c6_unused_int      /* 15: unused */
+    j   _tx_esp32c6_unused_int      /* 16: unused */
+    j   _tx_esp32c6_unused_int      /* 17: unused */
+    j   _tx_esp32c6_unused_int      /* 18: unused */
+    j   _tx_esp32c6_unused_int      /* 19: unused */
+    j   _tx_esp32c6_unused_int      /* 20: unused */
+    j   _tx_esp32c6_unused_int      /* 21: unused */
+    j   _tx_esp32c6_unused_int      /* 22: unused */
+    j   _tx_esp32c6_unused_int      /* 23: unused */
+    j   _tx_esp32c6_unused_int      /* 24: unused (ETS_INT_WDT_INUM in FreeRTOS) */
+    j   _tx_esp32c6_unused_int      /* 25: unused */
+    j   _tx_esp32c6_unused_int      /* 26: unused */
+    j   _tx_esp32c6_unused_int      /* 27: unused */
+    j   _tx_esp32c6_unused_int      /* 28: unused */
+    j   _tx_esp32c6_unused_int      /* 29: unused */
+    j   _tx_esp32c6_unused_int      /* 30: unused */
+    j   _tx_esp32c6_unused_int      /* 31: unused */
+
+    .option pop
+
 /*
+ * _tx_esp32c6_exception_entry
+ *
+ * CPU exceptions (illegal instruction, misaligned access, stack overflow, etc.)
+ * arrive here via vector[0]. We switch to a known-good stack and call abort()
+ * so the ESP-IDF panic handler can produce a proper crash dump.
+ *
+ * We do NOT run _tx_thread_context_save first — if the exception was caused by
+ * a stack overflow the thread stack is already corrupt, and attempting to save
+ * to it would cause further corruption before we get any output.
+ */
+    .extern _tx_thread_system_stack_ptr
+    .extern abort
+    .type _tx_esp32c6_exception_entry, @function
+_tx_esp32c6_exception_entry:
+    /* Switch to system stack so abort() has a valid stack to run on */
+    la      t0, _tx_thread_system_stack_ptr
+    LOAD    sp, 0(t0)
+    call    abort           /* noreturn — triggers ESP-IDF panic handler */
+    j       _tx_esp32c6_exception_entry  /* should never reach here */
+    .size _tx_esp32c6_exception_entry, . - _tx_esp32c6_exception_entry
+
+/* Catch-all for any interrupt line we didn't register */
+    .type _tx_esp32c6_unused_int, @function
+_tx_esp32c6_unused_int:
+    j   _tx_esp32c6_unused_int  /* spin — should never arrive here */
+    .size _tx_esp32c6_unused_int, . - _tx_esp32c6_unused_int
+
+
+/* =========================================================================
  * _tx_initialize_low_level
  *
  * Called from tx_initialize_kernel_enter() before tx_application_define().
  * At this point we're running on the ESP-IDF startup stack.
- */
+ * ========================================================================= */
+    .section .text
     .align 4
     .type _tx_initialize_low_level, @function
 _tx_initialize_low_level:
@@ -67,9 +171,16 @@ _tx_initialize_low_level:
     STORE   t1, 0(t0)
 
     /*
-     * 3. Install our trap handler in mtvec (direct mode, bit 0 = 0).
+     * 3. Install our vector table in mtvec.
+     *
+     *    ESP32-C6 ALWAYS uses vectored dispatch:
+     *      exception    → table[0]  (= table base address)
+     *      interrupt N  → table[N]  (= table base + N*4)
+     *    The table must be 256-byte aligned (CPU ignores lowest 8 bits).
+     *
+     *    We point mtvec at _tx_esp32c6_vector_table which is .balign 256.
      */
-    la      t0, _tx_esp32c6_trap_handler
+    la      t0, _tx_esp32c6_vector_table
     csrw    mtvec, t0
 
     /*
@@ -100,20 +211,31 @@ _tx_initialize_low_level:
 __tx_free_memory_start:
     .word   0
 
-    .section .text
-
-/*
+/* =========================================================================
  * _tx_esp32c6_trap_handler
  *
  * Unified trap/interrupt handler for ThreadX on ESP32-C6.
  *
+ * Reached via the vector table:
+ *   - vector[7]: CPU interrupt line 7 / SYSTIMER tick (mcause bit 31 = 1)
+ *
+ * MUST be in .iram0.text — the vector table entries are 4-byte `j` (JAL)
+ * instructions with ±1MB range. IRAM is ~0x40800000, flash is ~0x42000000,
+ * so the handler must be in IRAM for the vector table jump to reach it.
+ *
  * The ThreadX context save/restore calling convention requires:
- *   1. Allocate interrupt stack frame (32 * REGBYTES)
+ *   1. Allocate interrupt stack frame (32 * REGBYTES = 128 bytes on RV32)
  *   2. Save x1 (RA) at offset 28*REGBYTES into the frame
- *   3. Call _tx_thread_context_save (saves all other scratch regs)
+ *      (context_save will overwrite it via its own 'call' prologue)
+ *   3. Call _tx_thread_context_save (saves all other scratch regs + mepc)
  *   4. Handle the interrupt
- *   5. Call _tx_thread_context_restore (does not return — mret)
- */
+ *   5. Jump to _tx_thread_context_restore (does NOT return — ends with mret)
+ *
+ * Note on _tx_thread_context_restore: it lives in flash (.text). We cannot
+ * reach it with a plain `j` (JAL, ±1MB) from IRAM. We use `la + jr`
+ * (register-indirect jump) which has unlimited range.
+ * ========================================================================= */
+    .section .iram0.text,"ax",@progbits
     .align 4
     .type _tx_esp32c6_trap_handler, @function
 _tx_esp32c6_trap_handler:
@@ -129,13 +251,13 @@ _tx_esp32c6_trap_handler:
 
     /* Now running on system stack (if first interrupt) or same stack (if nested) */
 
-    /* Read mcause to determine interrupt vs exception */
+    /* Read mcause to determine interrupt vs exception.
+     * Exceptions should not reach here — they go via vector[0] to
+     * _tx_esp32c6_exception_entry which calls abort(). If we somehow
+     * arrive here for an exception, redirect. */
     csrr    t0, mcause
     bltz    t0, _handle_interrupt     /* bit 31 set = interrupt */
-
-    /* Exception — for now just spin (shouldn't happen in normal operation) */
-_handle_exception:
-    j       _handle_exception
+    j       _tx_esp32c6_exception_entry /* exception: should not happen */
 
 _handle_interrupt:
     /*
@@ -160,7 +282,10 @@ _handle_interrupt:
     call    _tx_esp32c6_timer_isr
 
 _int_done:
-    /* Step 5: Restore context — this does NOT return (ends with mret) */
-    j       _tx_thread_context_restore
+    /* Step 5: Restore context — this does NOT return (ends with mret).
+     * _tx_thread_context_restore is in flash (.text). We cannot use `j`
+     * (JAL, ±1MB) from IRAM. Use la+jr for unlimited-range tail-call. */
+    la      t0, _tx_thread_context_restore
+    jr      t0
 
     .size _tx_esp32c6_trap_handler, . - _tx_esp32c6_trap_handler

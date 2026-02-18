@@ -13,15 +13,30 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "docs/threadx-port.md",
+                "file": "docs/implementation/architecture.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "threadx-port"
+              "title": "architecture"
+            }
+          },
+          {
+            "id": "1cdc594dd1dba157",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "errors.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "errors"
             }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "vertical"
@@ -94,7 +109,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "docs/threadx-port.md",
+                "file": "errors.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +119,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for threadx-port"
+              "title": "Backlinks for errors"
             }
           },
           {
@@ -113,12 +128,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "docs/threadx-port.md",
+                "file": "errors.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links from threadx-port"
+              "title": "Outgoing links from errors"
             }
           },
           {
@@ -156,13 +171,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "docs/threadx-port.md",
+                "file": "errors.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline of threadx-port"
+              "title": "Outline of errors"
             }
           }
         ]
@@ -183,27 +198,36 @@
       "bases:Create new base": false
     }
   },
-  "active": "f54fbc5f8eff5bac",
+  "active": "1cdc594dd1dba157",
   "lastOpenFiles": [
+    "build/log/idf_py_stdout_output_1187076",
+    "build/log/idf_py_stderr_output_1187076",
+    "build/log/idf_py_stdout_output_1187046",
+    "build/log/idf_py_stderr_output_1187046",
+    "build/threadx_esp32c6.bin",
+    "build/threadx_esp32c6.elf",
+    "build/esp-idf/threadx/st7PeUcb",
+    "build/esp-idf/threadx/styzqGdw",
+    "build/esp-idf/threadx/CMakeFiles/__idf_threadx.dir/threadx/ports/risc-v64/gnu/src/tx_timer_interrupt.c.obj",
+    "build/esp-idf/threadx/CMakeFiles/__idf_threadx.dir/threadx/ports/risc-v64/gnu/src/tx_timer_interrupt.c.obj.d",
+    "build/CMakeFiles/clean_additional.cmake.tmp224e0",
+    "docs/planning/esp32c6-hardware-investigation.md",
     "docs/hardware-interrupts.md",
-    "docs/freertos-compat.md",
-    "docs/bug-history.md",
-    "docs/bug-history.md.tmp.1065752.1771364406924",
-    "docs/build-reference.md",
-    "docs/README.md",
-    "docs/architecture.md",
-    "docs/build-reference.md.tmp.1065752.1771364313160",
-    "docs/freertos-compat.md.tmp.1065752.1771364283833",
+    "docs/implementation/assembly-deep-dive.md",
+    "docs/implementation/architecture.md",
     "errors.md",
-    "docs/threadx-port.md",
-    "docs/threadx-port.md.tmp.1065752.1771364227157",
-    "docs/assembly-deep-dive.md",
-    "docs/assembly-deep-dive.md.tmp.1065752.1771364179995",
-    "docs/hardware-interrupts.md.tmp.1065752.1771364056701",
-    "docs/architecture.md.tmp.1065752.1771363995291",
-    "docs/README.md.tmp.1065752.1771363952489",
-    "docs",
-    "build/log/idf_py_stdout_output_1088972",
+    "docs/planning/investigations/phase0-4-esp32c6-specifics.md",
+    "docs/planning/investigations/phase0-3-wifi-bt-stack-analysis.md",
+    "docs/planning/investigations/phase0-2-threadx-integration-requirements.md",
+    "docs/planning/investigations/phase0-1-esp-hal-deep-dive.md",
+    "docs/planning/threadx-menuconfig-integration-spec.md",
+    "docs/planning/threadx-esp-investigation-roadmap.md",
+    "docs/implementation/threadx-port.md",
+    "docs/implementation/hardware-interrupts.md",
+    "docs/implementation/freertos-compat.md",
+    "docs/implementation/bug-history.md",
+    "docs/implementation/build-reference.md",
+    "docs/implementation/README.md",
     "esp32c6-hardware-investigation.md",
     "components/threadx/threadx/utility/rtos_compatibility_layers/FreeRTOS/readme.md",
     "components/threadx/threadx/utility/low_power/low_power.md",
@@ -212,14 +236,7 @@
     "components/threadx/threadx/ports_arch/ARMv8-A/README.md",
     "components/threadx/threadx/ports_arch/ARMv7-A/README.md",
     "components/threadx/threadx/ports_arch/ARMv8-M/README.md",
-    "components/threadx/threadx/ports_arch/ARMv7-M/README.md",
     "components/threadx/threadx/docs/threadx-features.png",
-    "components/threadx/threadx/docs/deps.png",
-    "components/threadx/threadx/SECURITY.md",
-    "components/threadx/threadx/README.md",
-    "components/threadx/threadx/CONTRIBUTING.md",
-    "components/threadx/threadx/CHANGELOG.md",
-    "threadx-menuconfig-integration-spec.md",
-    "threadx-esp-investigation-roadmap.md"
+    "components/threadx/threadx/docs/deps.png"
   ]
 }
