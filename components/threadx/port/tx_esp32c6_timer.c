@@ -1,28 +1,40 @@
 /*
  * tx_esp32c6_timer.c — ESP32-C6 SYSTIMER tick for ThreadX
  *
- * PLIC configuration via direct register writes (Bug 27 fix):
+ * PLIC configuration via direct register writes:
  *   The esp_cpu_intr_* API functions (which proxy to ROM esprv_intc_int_enable)
- *   were observed to NOT set the PLIC ENABLE bit for CPU interrupt 7. Root cause
- *   is unclear (ROM function may overwrite rather than OR, or there is a mideleg
- *   delegation issue). We bypass the API and write PLIC registers directly using
- *   the addresses from soc/plic_reg.h (DR_REG_PLIC_MX_BASE = 0x20001000).
+ *   were observed to NOT set the PLIC ENABLE bit for CPU interrupt 7 (old design).
+ *   We bypass the API and write PLIC registers directly using the addresses from
+ *   soc/plic_reg.h (DR_REG_PLIC_MX_BASE = 0x20001000).
  *
  *   Register addresses (TIMER_CPU_INT_NUM = 17):
  *     PLIC_MXINT_ENABLE_REG   = 0x20001000 + 0x00  (bitmask: bit N enables line N)
- *     PLIC_MXINT_TYPE_REG     = 0x20001000 + 0x04  (bitmask: bit N=1 → edge)
+ *     PLIC_MXINT_TYPE_REG     = 0x20001000 + 0x04  (bitmask: bit N=1 → edge, 0 → level)
  *     PLIC_MXINT_CLEAR_REG    = 0x20001000 + 0x08  (write bit N to ack edge latch)
+ *     PLIC_EMIP_STATUS_REG    = 0x20001000 + 0x0C  (read: which edge latches are set)
  *     PLIC_MXINT17_PRI_REG    = 0x20001000 + 0x54  (4-bit priority for line 17)
  *     PLIC_MXINT_THRESH_REG   = 0x20001000 + 0x90  (lines with pri <= thresh masked)
  *
  *   FreeRTOS startup sets threshold = 1 (RVHAL_INTR_ENABLE_THRESH). Our priority
  *   must be STRICTLY GREATER than the threshold, so we use priority 2.
  *
+ *   LEVEL-TRIGGERED (matches FreeRTOS vSystimerSetup, no ESP_INTR_FLAG_EDGE):
+ *   We use level-triggered mode (TYPE bit 17 = 0) for SYSTIMER, matching the
+ *   FreeRTOS port_systick.c approach. With level-triggered:
+ *     - While SYSTIMER INT_ST=1, PLIC continuously asserts mip.bit17
+ *     - CPU takes interrupt → ISR clears INT_ST via systimer_ll_clear_alarm_int()
+ *     - Clearing INT_ST drops the SYSTIMER output → PLIC deasserts mip.bit17
+ *     - 10ms later: next alarm fires → INT_ST=1 → interrupt fires again
+ *   Edge-triggered was previously used but caused issues because: if the alarm
+ *   had already fired (INT_ST=1, output=HIGH) when PLIC edge detection was
+ *   configured, there was no 0→1 transition for the PLIC to latch, so the
+ *   interrupt was never delivered.
+ *
  *   mideleg CSR bit 17 must be 0 so interrupt 17 is handled in machine mode.
  *   esp_intr_alloc() does "RV_CLEAR_CSR(mideleg, BIT(intr))" for exactly this.
  *
- * SYSTIMER hardware: still configured via systimer_hal_* / systimer_ll_* (HAL).
- * INTMTX routing:   still via esp_rom_route_intr_matrix() (ROM).
+ * SYSTIMER hardware: configured via systimer_hal_* / systimer_ll_* (HAL).
+ * INTMTX routing:   via esp_rom_route_intr_matrix() (ROM).
  *
  * Reference: components/freertos/port_systick.c vSystimerSetup()
  *            components/esp_hw_support/intr_alloc.c esp_intr_alloc()
@@ -64,6 +76,7 @@ extern VOID _tx_timer_interrupt(VOID);
 #define PLIC_MX_ENABLE      PLIC_REG(0x00)
 #define PLIC_MX_TYPE        PLIC_REG(0x04)
 #define PLIC_MX_CLEAR       PLIC_REG(0x08)
+#define PLIC_MX_EMIP        PLIC_REG(0x0C)  /* Edge Machine Interrupt Pending */
 #define PLIC_MX_PRI_N       PLIC_REG(0x10 + TIMER_CPU_INT_NUM * 4)  /* PRI[N] */
 #define PLIC_MX_THRESH      PLIC_REG(0x90)
 
@@ -143,29 +156,28 @@ void _tx_port_setup_timer_interrupt(void)
     systimer_hal_enable_counter(&s_systimer_hal, SYSTIMER_COUNTER_OS_TICK);
 
     /* ------------------------------------------------------------------ */
-    /* Step 3: Configure CPU interrupt line 7 via direct PLIC register     */
-    /* writes. The ESP-IDF API (esp_cpu_intr_*) proxies to a ROM function  */
-    /* (esprv_intc_int_enable at 0x40000720) that was observed to NOT set  */
-    /* the ENABLE bit. Direct writes are used instead.                     */
+    /* Step 3: Configure CPU interrupt line 17 via direct PLIC registers  */
     /* ------------------------------------------------------------------ */
 
-    /* 3a. Edge-triggered mode: set bit 7 of TYPE register */
-    PLIC_MX_TYPE |= (1u << TIMER_CPU_INT_NUM);
+    /* 3a. LEVEL-triggered mode (matches FreeRTOS vSystimerSetup):
+     *     Leave TYPE bit 17 = 0 (level). Do NOT set it to edge.
+     *     With level-triggered: PLIC asserts mip.bit17 continuously while
+     *     SYSTIMER INT_ST=1. ISR clears INT_ST → output drops → PLIC deasserts.
+     *     Edge-triggered caused problems because the PLIC may miss the rising
+     *     edge if the output is already HIGH when the PLIC is enabled/configured. */
+    PLIC_MX_TYPE &= ~(1u << TIMER_CPU_INT_NUM);   /* clear bit 17 = level */
 
     /* 3b. Priority 2 — must be > PLIC threshold (FreeRTOS sets it to 1) */
     PLIC_MX_PRI_N = TIMER_CPU_INT_PRIORITY;
 
-    /* 3c. Clear any pending edge latch before enabling */
-    PLIC_MX_CLEAR |= (1u << TIMER_CPU_INT_NUM);
-
-    /* 3d. Ensure interrupt 7 is handled in machine mode (not delegated).
+    /* 3c. Ensure interrupt 17 is handled in machine mode (not delegated).
      *     esp_intr_alloc() does this same CSR write for PLIC targets. */
     __asm__ volatile("csrc mideleg, %0" :: "r"(1u << TIMER_CPU_INT_NUM));
 
-    /* 3e. Enable CPU interrupt line 17 in the PLIC ENABLE register */
+    /* 3d. Enable CPU interrupt line 17 in the PLIC ENABLE register */
     PLIC_MX_ENABLE |= (1u << TIMER_CPU_INT_NUM);
 
-    /* 3f. Set mie CSR bit 17.
+    /* 3e. Set mie CSR bit 17.
      *     On ESP32-C6 the PLIC requires BOTH PLIC_ENABLE bit N AND mie bit N to be
      *     set for interrupt line N to fire.  The ROM esprv_intc_int_enable() does
      *     "csrs mie, mask" internally; our direct PLIC write only set PLIC_ENABLE.
@@ -178,20 +190,42 @@ void _tx_port_setup_timer_interrupt(void)
     /* Diagnostic: read back hardware registers to confirm configuration.  */
     /* Remove once timer is confirmed working.                             */
     /* ------------------------------------------------------------------ */
-    uint32_t mtvec_val, mie_val, mideleg_val;
+    uint32_t mtvec_val, mie_val, mip_val, mideleg_val, mstatus_val;
     __asm__ volatile("csrr %0, mtvec"   : "=r"(mtvec_val));
     __asm__ volatile("csrr %0, mie"     : "=r"(mie_val));
+    __asm__ volatile("csrr %0, mip"     : "=r"(mip_val));
     __asm__ volatile("csrr %0, mideleg" : "=r"(mideleg_val));
+    __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus_val));
 
     ESP_LOGI("tx_diag", "--- Timer HW State ---");
     ESP_LOGI("tx_diag", "mtvec          = 0x%08lx  (should match vector_table addr)", (uint32_t)mtvec_val);
+    ESP_LOGI("tx_diag", "mstatus        = 0x%08lx  (bit3 MIE, bit7 MPIE, bits12:11 MPP)", (uint32_t)mstatus_val);
     ESP_LOGI("tx_diag", "mie            = 0x%08lx  (bit11 MEIE must be 1 = 0x800)", (uint32_t)mie_val);
+    ESP_LOGI("tx_diag", "mip            = 0x%08lx  (bit17 pending = CPU sees interrupt)", (uint32_t)mip_val);
     ESP_LOGI("tx_diag", "mideleg        = 0x%08lx  (bit17 must be 0)", (uint32_t)mideleg_val);
     ESP_LOGI("tx_diag", "INTMTX src57   = 0x%08lx  (must be %d = cpu_int)", *(volatile uint32_t *)(0x60010000 + 57*4), TIMER_CPU_INT_NUM);
     ESP_LOGI("tx_diag", "PLIC ENABLE    = 0x%08lx  (bit17 must be set = 0x20000)", PLIC_MX_ENABLE);
-    ESP_LOGI("tx_diag", "PLIC TYPE      = 0x%08lx  (bit17 must be set = edge)", PLIC_MX_TYPE);
-    ESP_LOGI("tx_diag", "PLIC PRI[7]    = 0x%08lx  (must be > THRESH)", PLIC_MX_PRI_N);
-    ESP_LOGI("tx_diag", "PLIC THRESH    = 0x%08lx  (must be < PRI[7])", PLIC_MX_THRESH);
+    ESP_LOGI("tx_diag", "PLIC TYPE      = 0x%08lx  (bit17 must be 0 = level-triggered)", PLIC_MX_TYPE);
+    ESP_LOGI("tx_diag", "PLIC EMIP      = 0x%08lx  (edge-pending: bit17 only set if edge-mode)", PLIC_MX_EMIP);
+    ESP_LOGI("tx_diag", "PLIC PRI[17]   = 0x%08lx  (must be > THRESH)", PLIC_MX_PRI_N);
+    ESP_LOGI("tx_diag", "PLIC THRESH    = 0x%08lx  (must be < PRI[17])", PLIC_MX_THRESH);
+    /* Read SYSTIMER registers via the HAL dev pointer (base = 0x6000A000 on C6).
+     * Register map (from systimer_reg.h):
+     *   0x00 CONF:          bit31=clk_en, bit29=ctr1_en, bit30=ctr0_en, bit26=ctr1_stall, bit24=alm0_en
+     *   0x34 TARGET0_CONF:  bits[25:0]=period_ticks, bit30=period_mode, bit31=unit_sel(1→ctr1)
+     *   0x64 INT_ENA:       bit0=alarm0 int enabled
+     *   0x70 INT_ST:        bit0=alarm0 currently pending
+     * Expected after setup: CONF≈0xF7000002, TGT0≈0xC0027100 (160000 ticks,period,ctr1), INT_ENA≈0x1 */
+    volatile uint32_t *_st = (volatile uint32_t *)s_systimer_hal.dev;
+    ESP_LOGI("tx_diag", "SYSTIMER base  = 0x%08lx  (expect 0x6000A000)", (uint32_t)s_systimer_hal.dev);
+    ESP_LOGI("tx_diag", "SYSTIMER_CONF  = 0x%08lx  (bit31 clk_en, bit29 ctr1_en, bit24 alm0_en)",
+             _st[0x00/4]);
+    ESP_LOGI("tx_diag", "SYSTIMER TGT0  = 0x%08lx  (bit31=ctr_sel, bit30=period, [25:0]=ticks)",
+             _st[0x34/4]);   /* TARGET0_CONF_REG at offset 0x34 */
+    ESP_LOGI("tx_diag", "SYSTIMER INTENA= 0x%08lx  (bit0=alm0 int enabled)",
+             _st[0x64/4]);   /* INT_ENA_REG at offset 0x64 */
+    ESP_LOGI("tx_diag", "SYSTIMER INT_ST= 0x%08lx  (bit0=alm0 currently pending)",
+             _st[0x70/4]);   /* INT_ST_REG at offset 0x70 */
     ESP_LOGI("tx_diag", "----------------------");
 }
 
@@ -199,19 +233,24 @@ void _tx_port_setup_timer_interrupt(void)
  * _tx_esp32c6_timer_isr
  *
  * Called from the assembly trap handler (_tx_esp32c6_trap_handler) when
- * CPU interrupt line 7 fires.
+ * CPU interrupt line 17 fires (SYSTIMER alarm 0, level-triggered).
+ *
+ * For LEVEL-triggered operation:
+ *   1. Clear SYSTIMER INT_ST — this drops the SYSTIMER output LOW,
+ *      which causes the PLIC to deassert mip.bit17 automatically.
+ *   2. No PLIC CLEAR write needed (that is only for edge-triggered mode).
+ *   The PLIC will reassert after the next alarm fires 10ms later.
+ *
+ * This matches the FreeRTOS SysTickIsrHandler approach in port_systick.c.
  */
 void _tx_esp32c6_timer_isr(void)
 {
     g_tx_timer_isr_count++;   /* diagnostic: proof of ISR entry */
 
-    /* Clear the SYSTIMER alarm interrupt (stops the peripheral asserting the line) */
+    /* Clear the SYSTIMER alarm interrupt.
+     * This drops the SYSTIMER output LOW → PLIC deasserts mip.bit17 automatically.
+     * (No PLIC CLEAR needed — level-triggered mode, not edge-triggered.) */
     systimer_ll_clear_alarm_int(s_systimer_hal.dev, SYSTIMER_ALARM_OS_TICK_CORE0);
-
-    /* Clear the PLIC edge latch for our CPU interrupt line.
-     * Required for edge-triggered mode — without this the interrupt re-fires
-     * immediately after mret. */
-    PLIC_MX_CLEAR |= (1u << TIMER_CPU_INT_NUM);
 
     /* Advance the ThreadX tick counter, wake sleeping threads */
     _tx_timer_interrupt();

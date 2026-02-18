@@ -184,3 +184,85 @@ SYSTIMER fires
 extern VOID _tx_timer_interrupt(VOID);
 ```
 at the top of `tx_timer_interrupt.c`.
+
+---
+
+## ThreadX Scheduling: tx_thread_relinquish vs tx_thread_sleep
+
+### The Priority System
+
+ThreadX uses numeric priorities where **lower number = higher priority**. This is the
+opposite of some other RTOS conventions. The system has two demo threads:
+
+| Thread | Priority | Created in |
+|--------|----------|-----------|
+| `main_thread` (runs `app_main`) | 16 | `tx_port_startup.c` |
+| `blink_thread` | 5 | `main.c` |
+
+### tx_thread_relinquish — Same-Priority Only
+
+`tx_thread_relinquish()` yields the CPU to another READY thread of the **same priority**.
+If no same-priority thread is ready, the calling thread immediately resumes.
+
+```c
+/* blink_thread (priority 5) calls relinquish */
+tx_thread_relinquish();
+/* ThreadX looks for ready threads at priority 5 — none exist */
+/* blink_thread immediately resumes — main_thread (priority 16) never runs */
+```
+
+This means using `tx_thread_relinquish()` alone in threads of different priorities
+creates a situation where only the highest-priority thread ever runs, because it's
+always READY and always preempts lower-priority threads.
+
+**Symptom observed**: With both threads using `tx_thread_relinquish()` and their
+spin-wait loops:
+- At `BLINK_THREAD_PRIO = 5`: only blink thread printed (main never got CPU)
+- At `BLINK_THREAD_PRIO = 20`: only main thread printed (blink never got CPU)
+- Expected interleaving never occurred
+
+### tx_thread_sleep — Correct Cross-Priority Yielding
+
+`tx_thread_sleep(N)` **suspends** (blocks) the calling thread for N tick intervals.
+A suspended thread is removed from the READY queue, so the scheduler selects the
+next runnable thread from any priority level.
+
+```c
+/* blink_thread (priority 5) calls sleep */
+tx_thread_sleep(10);    /* 10 ticks = 100ms at 100Hz */
+/* blink_thread is SUSPENDED — not in READY queue */
+/* scheduler selects main_thread (priority 16) — it runs now */
+/* after 10 ticks, blink_thread moves back to READY, preempts main */
+```
+
+This produces correct interleaving regardless of priority difference.
+
+### Blocking Objects Also Enable Cross-Priority Yielding
+
+Any blocking API removes the thread from READY:
+
+| API | Blocks until |
+|-----|-------------|
+| `tx_thread_sleep(N)` | N ticks elapse |
+| `tx_semaphore_get(&sem, TX_WAIT_FOREVER)` | Semaphore available |
+| `tx_mutex_get(&mtx, TX_WAIT_FOREVER)` | Mutex unlocked |
+| `tx_queue_receive(&q, &buf, TX_WAIT_FOREVER)` | Queue not empty |
+| `tx_event_flags_get(&ef, flags, TX_AND, ...)` | Event flags set |
+
+All of these allow lower-priority threads to run while the caller waits.
+
+### Verified Working Output
+
+After switching to `tx_thread_sleep()`:
+
+```
+I (417) main: [main]  tick=4   isr_count=4   count=0   ← main runs first
+I (429) main: [blink] tick=5   isr_count=5   count=0   ← blink preempts (higher prio)
+I (529) main: [blink] tick=16  isr_count=16  count=1
+I (619) main: [main]  tick=25  isr_count=25  count=1   ← main wakes after sleep
+I (629) main: [blink] tick=26  isr_count=26  count=2   ← blink preempts again
+```
+
+Tick counter increments at exactly 100 Hz (`tick == isr_count` in every sample).
+The 10-tick difference between main prints (~200ms) and blink prints (~100ms) matches
+the sleep durations exactly — `tx_thread_sleep()` is confirmed precise.

@@ -146,6 +146,29 @@ _tx_esp32c6_unused_int:
     .type _tx_initialize_low_level, @function
 _tx_initialize_low_level:
 
+    /*
+     * 0. Disable global machine interrupts for the duration of initialization.
+     *
+     *    mstatus.MIE (bit 3) may be 1 from ESP-IDF startup. We MUST clear it
+     *    before configuring the timer, because:
+     *
+     *    With level-triggered PLIC (correct for SYSTIMER), as soon as the first
+     *    SYSTIMER alarm fires (~10ms after setup), the PLIC asserts mip.bit17.
+     *    If mstatus.MIE=1 at that moment, the CPU takes the interrupt, enters
+     *    _tx_esp32c6_trap_handler → _tx_thread_context_save, calls _tx_timer_interrupt(),
+     *    then calls _tx_thread_context_restore. If tx_application_define() has not
+     *    run yet, _tx_thread_execute_ptr=NULL, and _tx_thread_context_restore
+     *    enters its idle-wait path and HANGS FOREVER — tx_application_define()
+     *    never gets a chance to create any threads.
+     *
+     *    Fix: clear MIE here. The scheduler's first mret (in _tx_thread_schedule)
+     *    restores mstatus.MPIE→MIE=1, re-enabling interrupts at exactly the right
+     *    moment. This is standard ThreadX practice.
+     *
+     *    Bug 29: documented in docs/implementation/bug-history.md
+     */
+    csrci   mstatus, 0x8        /* clear MIE (bit 3) — disable global interrupts */
+
     /* Save return address */
     addi    sp, sp, -16
     STORE   ra, 0(sp)

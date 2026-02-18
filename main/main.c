@@ -16,8 +16,8 @@ static const char *TAG = "main";
 
 /* Second test thread */
 #define BLINK_STACK_SIZE    4096
-//#define BLINK_THREAD_PRIO   20
-#define BLINK_THREAD_PRIO   5
+#define BLINK_THREAD_PRIO   17
+//#define BLINK_THREAD_PRIO   5
 
 static TX_THREAD blink_thread;
 static UCHAR blink_thread_stack[BLINK_STACK_SIZE];
@@ -25,15 +25,19 @@ static UCHAR blink_thread_stack[BLINK_STACK_SIZE];
 static void blink_thread_entry(ULONG param)
 {
     (void)param;
+    uint32_t ms_val;
+    __asm__ volatile("csrr %0, mstatus" : "=r"(ms_val));
+    ESP_LOGI(TAG, "[blink] mstatus at thread start = 0x%08lx  (bit3 MIE must be 1)", (unsigned long)ms_val);
     ULONG count = 0;
 
     while (1) {
         /* Busy-wait ~50ms using a raw spin loop (no sleep) so we keep printing
          * even if tx_thread_sleep is broken. Spin count tuned for ~160 MHz. */
-        for (volatile uint32_t i = 0; i < 2000000UL; i++);
+//        for (volatile uint32_t i = 0; i < 2000000UL; i++);
         ESP_LOGI(TAG, "[blink] tick=%lu  isr_count=%lu  count=%lu",
                  tx_time_get(), (ULONG)g_tx_timer_isr_count, count++);
-        tx_thread_relinquish();   /* yield — let main run */
+	tx_thread_sleep(10);
+//        tx_thread_relinquish();   /* yield — let main run */
     }
 }
 
@@ -68,10 +72,11 @@ void app_main(void)
      * regardless of whether the tick timer works. */
     ULONG count = 0;
     while (1) {
-        for (volatile uint32_t i = 0; i < 4000000UL; i++);
+        //for (volatile uint32_t i = 0; i < 4000000UL; i++);
         ESP_LOGI(TAG, "[main]  tick=%lu  isr_count=%lu  count=%lu",
                  tx_time_get(), (ULONG)g_tx_timer_isr_count, count++);
-        tx_thread_relinquish();
+	tx_thread_sleep(20);
+        //tx_thread_relinquish();
     }
     
 }

@@ -1061,3 +1061,530 @@ Bug 27: fix applied — pending hardware verification that `isr_count` increment
 4. **Watchdog**: If tick never fires, the ESP-IDF task WDT will eventually
    reset the chip. The diagnostic busy-wait loops prevent this during
    investigation but add noise to timing measurements.
+
+---
+
+## Bug 28 Investigation: isr_count=0 Persists — All Hardware Verified Correct
+
+**Phase**: After Bug 27 fix applied and flashed. Threads run and print; timer
+ISR (`g_tx_timer_isr_count`) never increments; tick (`tx_time_get()`) stays 0.
+
+### Exact Serial Output (Hardware Run)
+
+```
+I (252) threadx_startup: === ThreadX taking over (port_start_app_hook) ===
+I (252) threadx_startup: Entering ThreadX kernel — FreeRTOS scheduler will not start
+I (259) tx_diag: --- Timer HW State ---
+I (262) tx_diag: mtvec          = 0x4080af01  (should match vector_table addr)
+--- 0x4080af01: _tx_esp32c6_vector_table at tx_initialize_low_level.S:74
+I (269) tx_diag: mie            = 0x0a020924  (bit11 MEIE must be 1 = 0x800)
+I (276) tx_diag: mideleg        = 0x00000011  (bit17 must be 0)
+I (282) tx_diag: INTMTX src57   = 0x00000011  (must be 17 = cpu_int)
+I (288) tx_diag: PLIC ENABLE    = 0x0a020124  (bit17 must be set = 0x20000)
+I (295) tx_diag: PLIC TYPE      = 0x00020000  (bit17 must be set = edge)
+I (301) tx_diag: PLIC PRI[7]    = 0x00000002  (must be > THRESH)
+I (307) tx_diag: PLIC THRESH    = 0x00000001  (must be < PRI[7])
+I (313) tx_diag: ----------------------
+I (316) threadx_startup: tx_application_define: setting up system resources
+I (323) threadx_startup: ThreadX application defined — main thread created
+I (330) threadx_startup: Main thread started, calling app_main()
+I (335) main: ============================================
+I (340) main:   ThreadX on ESP32-C6 — Demo Application
+I (345) main: ============================================
+I (351) main: ThreadX version: 6
+I (354) main: Tick rate: 100 Hz
+I (457) main: [blink] tick=0  isr_count=0  count=0
+I (557) main: [blink] tick=0  isr_count=0  count=1
+I (657) main: [blink] tick=0  isr_count=0  count=2
+I (757) main: [blink] tick=0  isr_count=0  count=3
+I (857) main: [blink] tick=0  isr_count=0  count=4
+```
+
+Note: `[blink]` prints are tagged `main` in the log because of the esp_log TAG.
+Both blink_thread and main_thread run and print at their busy-wait cadence.
+Tick and isr_count stay at 0 indefinitely. No crash, no watchdog reset.
+
+---
+
+### Register-by-Register Analysis
+
+| Register | Value | Bit(s) checked | Status |
+|---|---|---|---|
+| mtvec | `0x4080af01` | top 24 bits = `0x4080af00` = `_tx_esp32c6_vector_table` | ✓ Correct |
+| mie | `0x0a020924` | bit 11 (MEIE) = `0x924 & 0x800 = 0x800` ≠ 0 → **set** | ✓ |
+| mie | `0x0a020924` | bit 17 = `0x0a020924 & 0x20000 = 0x20000` ≠ 0 → **set** | ✓ |
+| mideleg | `0x00000011` | bit 17 = `0x11 & 0x20000 = 0` → **not delegated** | ✓ |
+| INTMTX src57 | `0x00000011` | = 17 (decimal) → routes to CPU line 17 | ✓ |
+| PLIC ENABLE | `0x0a020124` | bit 17 = `0x0a020124 & 0x20000 = 0x20000` ≠ 0 | ✓ |
+| PLIC TYPE | `0x00020000` | bit 17 → edge-triggered | ✓ |
+| PLIC PRI[17] | `0x00000002` | priority 2 > threshold 1 | ✓ |
+| PLIC THRESH | `0x00000001` | threshold 1 < priority 2 | ✓ |
+
+All checked registers are correctly configured. The interrupt should fire. Yet
+`isr_count` stays 0.
+
+**Note on diagnostic label**: The print says `PLIC PRI[7]` but the code reads
+`PLIC_MX_PRI_N = PLIC_REG(0x10 + TIMER_CPU_INT_NUM * 4)` = line 17's priority
+register. The label is cosmetically wrong; the value is correct.
+
+---
+
+### Two Missing Diagnostic Values
+
+The diagnostic does NOT print two important values:
+
+**1. `mstatus` CSR** — controls whether the CPU actually accepts interrupts
+during thread execution. We print `mie` (per-interrupt enables) but not
+`mstatus.MIE` (the global gate).
+
+**2. SYSTIMER_CONF_REG (`0x60058000`)** — controls whether counter 1
+(SYSTIMER_COUNTER_OS_TICK) is actually running. The HAL calls
+`systimer_hal_enable_counter` which should set bit 31 of this register.
+If that bit is 0, the counter is stopped and the alarm never fires.
+
+---
+
+### Candidate Root Cause A: `mstatus.MIE = 0` During Thread Execution
+
+The ThreadX scheduler (`tx_thread_schedule.S`, risc-v64/gnu port) hardcodes
+`mstatus = 0x1880` before every `mret` when dispatching a thread:
+
+```asm
+; From tx_thread_schedule.S lines 203–208 (risc-v64/gnu port)
+li    t0, 0x1880    ; MPIE=1 (bit 7), MPP=M-mode (bits 12:11), MIE=0 (bit 3)
+csrw  mstatus, t0
+mret                ; mret: MIE ← MPIE = 1 → thread runs with MIE = 1
+```
+
+The value `0x1880` decoded:
+- bit  3 (MIE)  = 0 — cleared now, BEFORE mret
+- bit  7 (MPIE) = 1 — "previous interrupt enable" = 1
+- bits 12:11 (MPP) = 11 — previous privilege = machine mode
+
+`mret` does: `MIE ← MPIE` (so MIE becomes 1), `MPIE ← 1`, `privilege ← MPP`.
+**After mret, threads should run with MIE = 1.**
+
+However, if something modifies `mstatus.MIE` to 0 between mret and the SYSTIMER
+alarm firing (e.g., a stray `csrci mstatus, 8` in some ESP-IDF code that runs
+during thread startup), interrupts would be blocked.
+
+**To verify**: Read `mstatus` from inside the blink thread entry function:
+
+```c
+uint32_t mstatus_val;
+__asm__ volatile("csrr %0, mstatus" : "=r"(mstatus_val));
+ESP_LOGI(TAG, "[blink] mstatus = 0x%08lx  (bit3 MIE must be 1)", mstatus_val);
+```
+
+If `mstatus_val & 0x8 == 0`, MIE is disabled — interrupts are globally masked
+during thread execution and the SYSTIMER alarm can never be taken.
+
+---
+
+### Candidate Root Cause B: SYSTIMER Counter 1 Not Running
+
+The HAL sequence calls:
+1. `systimer_ll_reset_register()` — resets SYSTIMER_CONF_REG to 0 (clears ALL bits)
+2. `systimer_hal_enable_counter(&hal, SYSTIMER_COUNTER_OS_TICK)` — should set
+   the counter-1 enable bit (bit 31 of SYSTIMER_CONF_REG = `timer_unit1_work_en`)
+
+If step 2 does not correctly set bit 31, counter 1 stays at value 0 forever.
+The alarm (which fires when the counter reaches `current_count + period`) would
+see the counter never advancing — the alarm threshold is also 0 but after reset
+is immediately written to a non-zero value, so the counter would need to wrap
+around the 52-bit space (never in practice).
+
+**To verify**: Read SYSTIMER_CONF_REG from the diagnostic:
+
+```c
+uint32_t systimer_conf = *(volatile uint32_t *)0x60058000;
+ESP_LOGI("tx_diag", "SYSTIMER_CONF   = 0x%08lx  (bit31 counter1_en must be 1)",
+         systimer_conf);
+```
+
+Bit 31 = `timer_unit1_work_en`. If 0, counter 1 is stopped.
+
+---
+
+### Secondary Bug Found: `_tx_thread_context_restore.S` Wrong Offset for RV32
+
+While auditing the port assembly, a secondary bug was identified in the upstream
+`threadx/ports/risc-v64/gnu/src/tx_thread_context_restore.S`.
+
+**File**: `components/threadx/threadx/ports/risc-v64/gnu/src/tx_thread_context_restore.S`
+
+**Location**: The `_tx_thread_no_preempt_restore` path (non-nested interrupt
+return, no thread switch).
+
+**Bug** (approximate line 263):
+```asm
+; THIS IS WRONG on RV32 (ESP32-C6):
+LOAD  t0, 240(sp)   ; hardcoded 240 instead of 30*REGBYTES
+csrw  mepc, t0
+```
+
+The constant `240` is correct for RV64 (`30 * 8 = 240`) but wrong for RV32
+(`30 * 4 = 120`). On ESP32-C6 (RV32), this loads `mepc` from `sp + 240`
+instead of `sp + 120`, reading garbage from the wrong stack location.
+
+**Effect**: This bug fires on the **first successful ISR return** that has no
+pending thread switch. The `mret` instruction will jump to a garbage address,
+causing an immediate instruction-fetch exception. This would present as a crash
+immediately after the first SYSTIMER ISR fires — but since `isr_count = 0`
+currently, this bug has not yet been triggered.
+
+**Why this is not the current problem**: The ISR never fires at all (isr_count
+stays 0), so the context restore path is never reached. This is a secondary bug
+that will need to be fixed once the primary ISR-not-firing problem is resolved.
+
+The `LOAD` macro from `tx_port.h` correctly expands to `lw` on RV32 and `ld`
+on RV64 — so `LOAD t0, 240(sp)` compiles correctly as `lw t0, 240(sp)` on
+RV32. The macro is not the bug; the hardcoded offset `240` is the bug.
+
+**Fix (to apply after primary issue resolved)**:
+```asm
+; Change from:
+LOAD  t0, 240(sp)
+
+; Change to:
+LOAD  t0, 30*REGBYTES(sp)   ; = 120 on RV32, = 240 on RV64
+```
+
+This is equivalent to `lw t0, 120(sp)` on ESP32-C6. It reads `mepc` from the
+correct stack slot regardless of XLEN.
+
+---
+
+### Proposed Diagnostic Additions (Not Yet Applied)
+
+Three additions to narrow down the root cause:
+
+**1. Add `mstatus` readback to `_tx_port_setup_timer_interrupt`** (in
+`components/threadx/port/tx_esp32c6_timer.c`):
+
+```c
+uint32_t mstatus_val;
+__asm__ volatile("csrr %0, mstatus" : "=r"(mstatus_val));
+ESP_LOGI("tx_diag", "mstatus        = 0x%08lx  (bit3 MIE, bit7 MPIE)", mstatus_val);
+```
+
+**2. Add SYSTIMER_CONF_REG readback to same diagnostic block**:
+
+```c
+ESP_LOGI("tx_diag", "SYSTIMER_CONF  = 0x%08lx  (bit31 ctr1_en, bit30 ctr0_en, bit24 alarm0_en)",
+         *(volatile uint32_t *)0x60058000);
+```
+
+**3. Add `mstatus` print inside `blink_thread_entry` before the loop** (in
+`main/main.c`):
+
+```c
+static void blink_thread_entry(ULONG param)
+{
+    uint32_t ms_val;
+    __asm__ volatile("csrr %0, mstatus" : "=r"(ms_val));
+    ESP_LOGI(TAG, "[blink] mstatus at thread start = 0x%08lx  (bit3 MIE must be 1)", ms_val);
+    // rest of loop...
+}
+```
+
+If Root Cause A: the thread-entry print will show `mstatus & 0x8 == 0`.
+If Root Cause B: the diagnostic print will show `SYSTIMER_CONF bit31 == 0`.
+
+---
+
+### Current Status After Bug 28 Analysis
+
+- All PLIC / INTMTX / mie / mideleg / mtvec registers: **verified correct**
+- `isr_count` = 0: **ISR never reached** — root cause not yet pinned
+- Two candidates identified: mstatus.MIE = 0 (A) or SYSTIMER counter stopped (B)
+- Secondary bug in `_tx_thread_context_restore.S` at `LOAD t0, 240(sp)`:
+  **identified, not yet fixed** (harmless until ISR fires)
+- Next action: add `mstatus` + SYSTIMER_CONF_REG diagnostics, rebuild, flash
+
+---
+
+## Bug 28 (continued) — Second Diagnostic Run and Root Cause Identified
+
+### Second Diagnostic Run Output (corrected SYSTIMER offsets)
+
+```
+I (259) tx_diag: --- Timer HW State ---
+I (263) tx_diag: mtvec          = 0x4080af01  (should match vector_table addr)
+--- 0x4080af01: _tx_esp32c6_vector_table at tx_initialize_low_level.S:74
+I (270) tx_diag: mstatus        = 0x00000009  (bit3 MIE, bit7 MPIE, bits12:11 MPP)
+I (277) tx_diag: mie            = 0x0a020924  (bit11 MEIE must be 1 = 0x800)
+I (284) tx_diag: mideleg        = 0x00000011  (bit17 must be 0)
+I (289) tx_diag: INTMTX src57   = 0x00000011  (must be 17 = cpu_int)
+I (295) tx_diag: PLIC ENABLE    = 0x0a020124  (bit17 must be set = 0x20000)
+I (302) tx_diag: PLIC TYPE      = 0x00020000  (bit17 must be set = edge)
+I (308) tx_diag: PLIC PRI[17]   = 0x00000002  (must be > THRESH)
+I (314) tx_diag: PLIC THRESH    = 0x00000001  (must be < PRI[17])
+I (320) tx_diag: SYSTIMER base  = 0x6000a000  (expect 0x6000A000)
+I (326) tx_diag: SYSTIMER_CONF  = 0xf7000002  (bit31 clk_en, bit29 ctr1_en, bit24 alm0_en)
+I (334) tx_diag: SYSTIMER TGT0  = 0xc0027100  (bit31=ctr_sel, bit30=period, [25:0]=ticks)
+I (342) tx_diag: SYSTIMER INTENA= 0x00000005  (bit0=alm0 int enabled)
+I (348) tx_diag: SYSTIMER INT_ST= 0x00000001  (bit0=alm0 currently pending)
+I (354) tx_diag: ----------------------
+I (358) threadx_startup: tx_application_define: setting up system resources
+I (365) threadx_startup: ThreadX application defined — main thread created
+I (372) threadx_startup: Main thread started, calling app_main()
+I (377) main: ============================================
+I (382) main:   ThreadX on ESP32-C6 — Demo Application
+I (393) main: ThreadX version: 6
+I (396) main: Tick rate: 100 Hz
+I (398) main: [blink] mstatus at thread start = 0x00000088  (bit3 MIE must be 1)
+I (506) main: [blink] tick=0  isr_count=0  count=0
+... (isr_count stays 0 indefinitely)
+```
+
+### Full Register Analysis
+
+| Register | Value | Interpretation |
+|----------|-------|----------------|
+| mtvec | 0x4080af01 | ✓ Our vector table, vectored mode (bit0=1) |
+| mstatus | 0x00000009 | ✓ MIE=1 (bit3), UIE=1 (bit0) |
+| mie | 0x0a020924 | ✓ MEIE=1 (bit11), line17=1 (bit17), FreeRTOS lines (2,5,8,25,27) |
+| mideleg | 0x00000011 | ✓ bit17=0 (not delegated), bits0,4 are U-mode timer/SW |
+| INTMTX src57 | 0x00000011=17 | ✓ Source 57 (SYSTIMER_TARGET0) → CPU line 17 |
+| PLIC ENABLE | 0x0a020124 | ✓ bit17 set |
+| PLIC TYPE | 0x00020000 | **bit17=1 = EDGE-triggered** ← ROOT CAUSE |
+| PLIC PRI[17] | 0x00000002 | ✓ Priority 2 > threshold 1 |
+| PLIC THRESH | 0x00000001 | ✓ Threshold 1 |
+| SYSTIMER CONF | 0xf7000002 | ✓ Counter1 running (bit29), alarm0 enabled (bit24) |
+| SYSTIMER TGT0 | 0xc0027100 | ✓ Counter1 selected (bit31), periodic (bit30), 160000 ticks |
+| SYSTIMER INTENA | 0x00000005 | ✓ bit0=alarm0 int enabled |
+| SYSTIMER INT_ST | 0x00000001 | Alarm 0 pending — interrupt signal asserted |
+| mstatus in thread | 0x00000088 | ✓ MIE=1 (bit3), MPIE=1 (bit7) |
+
+### Root Cause: Edge-Triggered Mode
+
+**All hardware registers are correctly configured EXCEPT the PLIC trigger mode.**
+
+We set `PLIC_MX_TYPE |= (1u << 17)` which configures line 17 as **edge-triggered**.
+This was wrong because:
+
+1. Setup sequence: configure SYSTIMER → start counter → configure PLIC (TYPE/ENABLE/mie)
+2. SYSTIMER alarm fires ~10ms after counter starts
+3. By the time we reach the diagnostic prints (~90ms elapsed), INT_ST=1 (alarm has fired)
+4. With edge-triggered mode: the PLIC detects a **0→1 rising edge** on the input to set its latch
+5. **Problem**: if the SYSTIMER output was already HIGH (INT_ST=1) when the PLIC TYPE bit
+   was written (step 3a in setup), the PLIC never saw a rising edge to latch
+6. More precisely: even if we set TYPE=edge and ENABLE before the first alarm fires,
+   the setup code clears the edge latch (`PLIC_MX_CLEAR`) immediately after enabling.
+   Then INT_ST stays HIGH permanently (ISR never clears it). In periodic mode without
+   the ISR running, INT_ST stays asserted. With edge-triggered PLIC, there is no
+   NEW rising edge → PLIC latch never gets set → mip.bit17 never asserted → ISR never fires.
+
+**The key insight**: FreeRTOS (`port_systick.c vSystimerSetup`) uses `esp_intr_alloc()`
+without `ESP_INTR_FLAG_EDGE` → **level-triggered by default**. Level-triggered means:
+- While SYSTIMER INT_ST=1, PLIC continuously asserts mip.bit17
+- CPU takes interrupt → ISR clears INT_ST → output goes LOW → PLIC deasserts automatically
+- No PLIC CLEAR register write needed in ISR
+
+### Fix Applied (Bug 28)
+
+1. **`tx_esp32c6_timer.c` setup**: Changed from `PLIC_MX_TYPE |= (1u << 17)` to
+   `PLIC_MX_TYPE &= ~(1u << 17)` (level-triggered)
+2. **`tx_esp32c6_timer.c` setup**: Removed `PLIC_MX_CLEAR |= (1u << 17)` (not needed for level)
+3. **`_tx_esp32c6_timer_isr`**: Removed `PLIC_MX_CLEAR |= (1u << N)` from ISR
+4. **Diagnostic**: Added `mip` CSR readout and `PLIC_EMIP` (edge pending status) readout
+5. **Diagnostic**: Fixed `PLIC TYPE` label from "must be set = edge" to "must be 0 = level"
+
+With level-triggered operation the ISR just needs to call `systimer_ll_clear_alarm_int()`
+which drops the SYSTIMER output LOW, causing the PLIC to automatically deassert mip.bit17.
+
+---
+## Bug 29: Complete System Hang After Level-Triggered Fix — ISR Fires Before Threads Exist
+
+**Phase**: After Bug 28 fix (level-triggered PLIC)
+
+**Symptom**: After switching to level-triggered PLIC mode (Bug 28 fix), the system
+produces **no output at all** from any thread. The last message printed is from
+the startup hook:
+
+```
+I (252) threadx_startup: === ThreadX taking over (port_start_app_hook) ===
+I (252) threadx_startup: Entering ThreadX kernel — FreeRTOS scheduler will not start
+```
+
+Then complete silence — `app_main()` never prints, `blink_thread_entry` never prints,
+tick counter never increments. The device appears to hang indefinitely.
+
+**What changed**: Bug 28 fix switched PLIC from edge-triggered to level-triggered.
+This means the PLIC now continuously asserts mip.bit17 as long as SYSTIMER INT_ST=1.
+
+**Root Cause: Timer ISR fires before tx_application_define() creates any threads**
+
+Execution sequence that causes the hang:
+
+```
+port_start_app_hook()
+  → tx_kernel_enter()
+    → _tx_initialize_low_level()           ← sets up timer, csrs mie, 0x800
+      → _tx_port_setup_timer_interrupt()   ← arms SYSTIMER alarm (10ms to first tick)
+      ← returns (mstatus.MIE still 1 from ESP-IDF!)
+    ← returns
+    → tx_application_define()             ← would create threads, but...
+```
+
+**Problem**: ESP-IDF startup leaves `mstatus.MIE=1` (global interrupt enable).
+After `_tx_port_setup_timer_interrupt()` arms the SYSTIMER with level-triggered PLIC:
+
+1. SYSTIMER counts down, alarm fires in ~10ms
+2. SYSTIMER INT_ST goes HIGH
+3. PLIC sees HIGH input, asserts mip.bit17 continuously
+4. CPU takes interrupt (mstatus.MIE=1 allows it)
+5. CPU jumps to vector[17] → `_tx_esp32c6_trap_handler`
+6. `call _tx_thread_context_save` — saves context of... what? No threads exist yet
+7. `call _tx_esp32c6_timer_isr` — clears INT_ST, calls `_tx_timer_interrupt()`
+8. `jr _tx_thread_context_restore` — tries to restore next thread to run
+9. **`_tx_thread_execute_ptr == NULL`** (no threads created yet!)
+10. `_tx_thread_context_restore` enters its idle-wait path
+11. **HANGS FOREVER in idle-wait** — `tx_application_define()` never executes,
+    no threads ever created, no output ever appears
+
+The key: with level-triggered mode, the timer ISR fires "too early" — before the
+kernel has a chance to run `tx_application_define()` and create any threads.
+With edge-triggered mode (Bug 28's wrong setting), the ISR never fired at all
+(isr_count=0). With level-triggered + `mstatus.MIE=1`, the ISR fires at the
+worst possible moment.
+
+**Why edge-triggered didn't show this bug**: Because with edge-triggered mode
+the ISR never fired at all — so the system degraded differently (threads ran
+but `tx_time_get()` never incremented). Level-triggered works correctly once
+the threading infrastructure is in place, but fires too early.
+
+**Fix: Disable mstatus.MIE at the start of _tx_initialize_low_level**
+
+Standard ThreadX practice: the low-level init function disables global interrupts
+at entry. The scheduler's first `mret` (in `_tx_thread_schedule`) restores
+`mstatus.MPIE → MIE = 1`, re-enabling interrupts at exactly the right moment
+(when the first thread is about to run).
+
+Added at the very beginning of `_tx_initialize_low_level` in `tx_initialize_low_level.S`:
+
+```asm
+_tx_initialize_low_level:
+    /* 0. Disable global machine interrupts for the duration of initialization.
+     *
+     *    mstatus.MIE (bit 3) may be 1 from ESP-IDF startup. We MUST clear it
+     *    before configuring the timer, because:
+     *
+     *    With level-triggered PLIC (correct for SYSTIMER), as soon as the first
+     *    SYSTIMER alarm fires (~10ms after setup), the PLIC asserts mip.bit17.
+     *    If mstatus.MIE=1 at that moment, the CPU takes the interrupt, enters
+     *    _tx_esp32c6_trap_handler → _tx_thread_context_save, calls _tx_timer_interrupt(),
+     *    then calls _tx_thread_context_restore. If tx_application_define() has not
+     *    run yet, _tx_thread_execute_ptr=NULL, and _tx_thread_context_restore
+     *    enters its idle-wait path and HANGS FOREVER — tx_application_define()
+     *    never gets a chance to create any threads.
+     *
+     *    Fix: clear MIE here. The scheduler's first mret (in _tx_thread_schedule)
+     *    restores mstatus.MPIE→MIE=1, re-enabling interrupts at exactly the right
+     *    moment. This is standard ThreadX practice.
+     */
+    csrci   mstatus, 0x8        /* clear MIE (bit 3) — disable global interrupts */
+```
+
+**Why this works**:
+
+```
+_tx_initialize_low_level:
+  csrci mstatus, 0x8           ← MIE now 0 — timer ISR cannot fire
+  ... set up timer, mie.MEIE ...
+  ret                          ← still MIE=0, mip.bit17 pending but not taken
+
+tx_application_define():
+  tx_thread_create(app_thread) ← threads created safely, no ISR interference
+  return
+
+_tx_thread_schedule:
+  ... find first runnable thread ...
+  mret                         ← MPIE=1 → MIE=1, first thread runs
+                               ← NOW timer ISR fires (threads exist, all is well)
+```
+
+**The mie.MEIE interaction**: Step 4 in `_tx_initialize_low_level` sets `mie.MEIE`
+(bit 11, which gates PLIC delivery). This is separate from `mstatus.MIE` (bit 3,
+global gate). Setting `mie.MEIE` while `mstatus.MIE=0` is safe — the pending
+interrupt will be remembered in `mip.bit17` and delivered when `mstatus.MIE=1`
+is restored by `mret` in `_tx_thread_schedule`.
+
+**Lesson**: When integrating a new RTOS into a system that leaves MIE=1 during
+startup (like ESP-IDF), the RTOS's low-level init MUST disable global interrupts
+explicitly. Do not rely on the caller to have left them disabled.
+
+---
+## System Working — Final Verified State (After Bug 29 Fix)
+
+**Status**: ThreadX fully operational on ESP32-C6 as of this milestone.
+
+**Verified serial output**:
+```
+I (252) threadx_startup: === ThreadX taking over (port_start_app_hook) ===
+I (252) threadx_startup: Entering ThreadX kernel — FreeRTOS scheduler will not start
+...
+I (374) threadx_startup: tx_application_define: setting up system resources
+I (381) threadx_startup: ThreadX application defined — main thread created
+I (387) threadx_startup: Main thread started, calling app_main()
+...
+I (417) main: [main]  tick=4  isr_count=4  count=0
+I (422) main: [blink] mstatus at thread start = 0x00000088  (bit3 MIE must be 1)
+I (429) main: [blink] tick=5  isr_count=5  count=0
+I (529) main: [blink] tick=16  isr_count=16  count=1
+I (619) main: [main]  tick=25  isr_count=25  count=1
+I (629) main: [blink] tick=26  isr_count=26  count=2
+I (729) main: [blink] tick=36  isr_count=36  count=3
+I (819) main: [main]  tick=45  isr_count=45  count=2
+```
+
+**Confirmed working**:
+- ThreadX scheduler boots and creates threads correctly
+- SYSTIMER tick fires at exactly 100 Hz (`tick == isr_count` in every line)
+- Two threads interleave: `[main]` (priority 16) and `[blink]` (priority 5)
+- `mstatus=0x00000088` in blink thread: bit 3 (MIE=1) and bit 7 (MPIE=1) — interrupts
+  enabled inside thread context as expected
+- `tx_thread_sleep()` works correctly — threads block for the specified number of ticks
+  and other threads run during the sleep period
+
+**Complete bug chain resolved**: Bugs 19 → 20 → 21 → 22–27 → 28 → 29 all fixed.
+
+---
+
+## Note: tx_thread_relinquish vs tx_thread_sleep — Scheduling Behavior
+
+**Observation during testing**: Using `tx_thread_relinquish()` in both threads
+did NOT produce interleaving output when the two threads had different priorities.
+Only after switching to `tx_thread_sleep()` did both threads print alternately.
+
+**Explanation**:
+
+`tx_thread_relinquish()` yields only to threads of the **same priority**. In ThreadX,
+lower priority number = higher priority. The two threads have:
+- `blink_thread`: priority 5 (`BLINK_THREAD_PRIO = 5`)
+- `main_thread`: priority 16 (`MAIN_THREAD_PRIORITY = 16`)
+
+When blink (priority 5) calls `tx_thread_relinquish()`, ThreadX looks for another
+READY thread at priority 5. There is none, so blink immediately resumes. Main
+(priority 16) never gets CPU time because blink (priority 5) is always ready and
+preempts it.
+
+`tx_thread_sleep(N)` **suspends** (blocks) the calling thread for N ticks. A suspended
+thread is removed from the READY queue entirely, so the scheduler can pick any other
+runnable thread regardless of priority. This is why sleep produces correct interleaving.
+
+**Summary**:
+
+| API | Behavior | Cross-priority yielding? |
+|-----|----------|--------------------------|
+| `tx_thread_relinquish()` | Yields to same-priority ready threads only | No |
+| `tx_thread_sleep(N)` | Blocks caller for N ticks, any thread can run | Yes |
+| `tx_thread_suspend(t)` | Blocks target thread indefinitely | Yes |
+
+For cooperative multitasking between threads of **different priorities**, always use
+`tx_thread_sleep()` or a blocking object (semaphore, mutex, event flags, queue).
+`tx_thread_relinquish()` is only useful for round-robin fairness within the same
+priority level.
+
+---
