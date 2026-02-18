@@ -867,31 +867,197 @@ interrupt entry.
 
 ---
 
+---
+
+## Bug 27: CPU Interrupt Line 7 Is CLINT-Reserved + `mie` Per-Line Bit Not Set
+
+**Phase**: After bug 26 fix. ISR not firing. Diagnostic counter `g_tx_timer_isr_count`
+stays 0 despite SYSTIMER being configured.
+
+**Symptom**: Both threads print `tick=0 isr_count=0` on every iteration (busy-wait
+loops used instead of `tx_thread_sleep` to rule out sleep issues). Hardware register
+readback shows:
+
+```
+PLIC ENABLE    = 0x0a000124   ← bit 7 NOT set (despite calling esp_cpu_intr_enable)
+PLIC TYPE      = 0x00000000   ← bit 7 NOT set
+PLIC PRI[7]    = 0x00000002   ← correctly set to 2
+PLIC THRESH    = 0x00000001   ← FreeRTOS default threshold
+```
+
+---
+
+### Root Cause Part 1: Line 7 Is Hardware-Reserved (CLINT-Bound)
+
+`esp_cpu_intr_enable(mask)` → `rv_utils_intr_enable(mask)` → `esprv_int_enable(mask)`.
+This last step is a ROM function alias for `esprv_intc_int_enable` at address
+`0x40000720`, linked via `PROVIDE(esprv_int_enable = esprv_intc_int_enable)` in
+`riscv/ld/rom.api.ld`.
+
+The ROM function **silently ignores** reserved lines. From
+`esp_hw_support/port/esp32c6/esp_cpu_intr.c`:
+
+```c
+// RISC-V Interrupt reserved mask
+const uint32_t rsvd_mask = BIT(1) | BIT(3) | BIT(4) | BIT(6) | BIT(7);
+/* Interrupts 3, 4 and 7 are unavailable for PULP CPU as they are bound
+ * to Core-Local Interrupts (CLINT) */
+```
+
+CPU interrupt line 7 is hardwired inside the CPU core to the CLINT (Core-Local
+Interrupt Timer, the hardware that drives `mtimecmp`/`mtime`). The PLIC cannot
+deliver anything on line 7 — the hardware physically prevents it. Writing the
+PLIC ENABLE bit for line 7 has no effect.
+
+Additionally from `intr_alloc.c`:
+```
+// Muxing an interrupt source to interrupt 6, 7, 11, 15, 16 or 29
+// causes the interrupt to effectively be disabled.
+```
+
+Line 7 appears in both lists: CLINT-reserved at the CPU level, and effectively
+disabled by the INTMTX routing hardware.
+
+**Fix — part 1**: Switch from CPU interrupt line 7 to line **17**. Line 17 is
+free for application use (not in any reserved mask). Updated `TIMER_CPU_INT_NUM`
+from 7 to 17 in `tx_esp32c6_timer.c` and moved the trap handler entry from
+`vector[7]` to `vector[17]` in the vector table.
+
+---
+
+### Root Cause Part 2: The `mie` CSR Per-Line Enable Bit
+
+After switching to line 17 and writing PLIC registers directly (bypassing the
+ROM function), a second diagnostic showed:
+
+```
+PLIC ENABLE    = 0x0a020124   ← bit 17 SET ✓
+PLIC TYPE      = 0x00020000   ← bit 17 SET (edge-triggered) ✓
+PLIC PRI[17]   = 0x00000002   ← priority 2 > threshold 1 ✓
+PLIC THRESH    = 0x00000001   ← FreeRTOS default ✓
+INTMTX src57   = 0x00000011   ← routes to line 17 ✓
+mie            = 0x0a000924   ← bit 17 = 0 ✗
+mideleg        = 0x00000011   ← bit 17 = 0 (machine mode) ✓
+isr_count      = 0            ← ISR still not reached
+```
+
+The PLIC is correctly configured but the ISR never fires. Key observation: the
+`mie` CSR shows bit 17 = 0.
+
+#### The `mie` CSR Per-Line Requirement (ESP32-C6 Specific)
+
+Standard RISC-V PLIC design requires only two things for external interrupts:
+1. `mie.MEIE` (bit 11) — the global "all external interrupts" gate
+2. PLIC priority/enable configuration
+
+The ESP32-C6 PLIC is non-standard. It requires **three** things:
+1. `mie.MEIE` (bit 11) — global external interrupt gate
+2. `PLIC_MXINT_ENABLE_REG bit N` — PLIC enable for CPU line N
+3. **`mie CSR bit N`** — per-line CPU enable for line N ← non-standard, not documented
+
+Evidence: Checking FreeRTOS's working interrupt lines (2, 5, 8, 25, 27) with
+the same diagnostic code shows their bits are set in **both** `PLIC_ENABLE` and
+`mie`. Our line 17 had only `PLIC_ENABLE bit 17` set; `mie bit 17` was 0.
+
+#### Why Direct Writes Miss This
+
+The ROM function `esprv_intc_int_enable` does both internally:
+```c
+// Pseudocode of the ROM function (from disassembly inference):
+PLIC_MXINT_ENABLE_REG |= mask;
+csrs mie, mask;          // <-- sets per-line mie bits too
+```
+
+Our direct volatile write to `PLIC_MXINT_ENABLE_REG` only did step 1. The
+`csrs mie` step was missing. This is why bypassing the ROM API broke things
+in a non-obvious way.
+
+**Fix — part 2**: After writing to PLIC_ENABLE, also set the per-line `mie` bit:
+
+```c
+/* Enable CPU interrupt line 17 in PLIC ENABLE register */
+PLIC_MX_ENABLE |= (1u << TIMER_CPU_INT_NUM);
+
+/* CRITICAL: Also set mie CSR bit 17.
+ * ESP32-C6 PLIC requires BOTH PLIC_ENABLE bit N AND mie bit N.
+ * The standard mie.MEIE (bit 11) alone is not sufficient.
+ * The ROM esprv_intc_int_enable() does "csrs mie, mask" internally;
+ * our direct register writes only set PLIC_ENABLE. */
+__asm__ volatile("csrs mie, %0" :: "r"(1u << TIMER_CPU_INT_NUM));
+```
+
+---
+
+### Additional Fixes Applied in This Investigation
+
+**`mideleg` — keep interrupt in machine mode**:
+
+`mideleg` is a CSR that controls which interrupts are delegated from machine
+mode to supervisor mode. If bit N of `mideleg` is 1, interrupt line N is
+handled in S-mode (supervisor), bypassing machine-mode handlers entirely.
+ThreadX runs in M-mode, so bit 17 must be 0:
+
+```c
+__asm__ volatile("csrc mideleg, %0" :: "r"(1u << TIMER_CPU_INT_NUM));
+```
+
+`esp_intr_alloc()` does this same write (`RV_CLEAR_CSR(mideleg, BIT(intr))`)
+for every interrupt it allocates.
+
+**Priority 2 instead of 1**:
+
+FreeRTOS startup sets `PLIC_MXINT_THRESH_REG = 1` (the constant
+`RVHAL_INTR_ENABLE_THRESH`). The PLIC only delivers interrupts with priority
+**strictly greater than** the threshold. Priority 1 ≤ threshold 1 → masked.
+Changed to priority 2.
+
+**Direct PLIC register writes instead of ROM API**:
+
+We keep the direct volatile writes (rather than reverting to `esp_cpu_intr_*`)
+because:
+- The ROM function silently drops reserved line masks (line 7 issue)
+- We now explicitly control all three requirements (PLIC_ENABLE, mie bit, mideleg)
+- The behavior is transparent and auditable from the source code
+
+---
+
+### Summary of All Bug 27 Changes
+
+| What changed | Before | After |
+|---|---|---|
+| `TIMER_CPU_INT_NUM` | 7 | 17 |
+| `TIMER_CPU_INT_PRIORITY` | 1 | 2 |
+| Vector table | trap handler at `vector[7]` | trap handler at `vector[17]` |
+| PLIC setup | `esp_cpu_intr_*` API | direct volatile register writes |
+| `mideleg` | not cleared | `csrc mideleg, (1u<<17)` |
+| `mie` bit N | not set (only bit 11 MEIE) | `csrs mie, (1u<<17)` |
+
+---
+
 ## Current Status (as of this writing)
 
 Bugs 1–9: confirmed fixed (build succeeds, pre-hardware verification).
 Bugs 10–18: HAL-based rewrites applied.
-Bugs 19–25: fixed previous session. Build succeeds.
-Bug 26: fixed this session — EIP_STATUS check removed from trap handler.
-Ready for hardware test to confirm tick advances and `tx_thread_sleep` works.
+Bugs 19–26: confirmed fixed — ThreadX boots, threads run, ISR dispatch correct.
+Bug 27: fix applied — pending hardware verification that `isr_count` increments.
 
 ## Remaining Questions for Audit
 
-1. **mstatus.MIE timing**: Is `mstatus.MIE` set at the point we set `mie.MEIE`?
-   The ESP-IDF startup code may have MIE cleared at this point — verify with JTAG.
+1. **`mie` per-line bits after context restore**: `_tx_thread_context_restore`
+   restores `mstatus` via `mret` (restoring `mstatus.MPIE` → `mstatus.MIE`).
+   It does NOT touch the `mie` CSR. Per-line `mie` bits we set in init should
+   persist — but verify they are not cleared by any ESP-IDF startup code after
+   our init runs.
 
-2. **Counter unit 0 auto-start**: Does counter unit 0 start counting automatically
-   when CLK_FO is set, or does it require the `TIMER_UNIT0_WORK_EN` bit (bit 30)
-   of SYSTIMER_CONF_REG to be set? It appears to be on by default but should be verified.
+2. **FreeRTOS threshold**: Verify `PLIC_MXINT_THRESH_REG` value at the point
+   `_tx_port_setup_timer_interrupt` runs. FreeRTOS may set it to 1 before or
+   after our init — the order matters. Current diagnostic reads it back; confirm
+   it shows 1, not a higher value that would block priority 2.
 
-3. **INTMTX reset state**: What CPU line does SYSTIMER_TARGET0 map to at reset?
-   If it defaults to line 0, and line 0 has unexpected behavior, we may see issues.
-   Verify by reading `0x600100E4` before and after our init.
+3. **Counter unit selection**: Current code uses SYSTIMER_COUNTER_OS_TICK
+   (counter 1) rather than counter 0. Verify counter 1 is not already in use
+   by any ESP-IDF component when running without the FreeRTOS scheduler.
 
-4. **PLIC MX priority registers**: Our priority register formula is
-   `0x20001010 + N*4`. Verify this matches the hardware by reading back the written
-   value for line 7 (`0x2000102C`) after init.
-
-5. **Exception handler**: The spin loop in `_handle_exception` silently halts
-   the CPU on any fault. A production port should log the mcause and mepc and
-   call a proper panic handler.
+4. **Watchdog**: If tick never fires, the ESP-IDF task WDT will eventually
+   reset the chip. The diagnostic busy-wait loops prevent this during
+   investigation but add noise to timing measurements.

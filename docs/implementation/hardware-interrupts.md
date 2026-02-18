@@ -43,7 +43,7 @@ Register address for source N:  0x60010000 + N * 4
 
 SYSTIMER_TARGET0 is source 57:
   Address = 0x60010000 + 57*4 = 0x600100E4
-  Write value = 7  (CPU interrupt line 7)
+  Write value = 17  (CPU interrupt line 17)
 ```
 
 **Reference**: `soc/esp32c6/include/soc/interrupts.h`
@@ -90,9 +90,12 @@ Priority register address = 0x20001000 + 0x10 + N * 4
                            = PLIC_MXINT0_PRI_REG + N * 4
 ```
 
-Interrupt fires if: `priority[N] > threshold` AND `enable[N] = 1`
+Interrupt fires if: `priority[N] > threshold` AND `enable[N] = 1` AND `mie bit N = 1`
 
-We use priority = 1, threshold = 0, so any enabled interrupt fires.
+**Threshold note**: FreeRTOS startup sets `PLIC_MXINT_THRESH_REG = 1`
+(constant `RVHAL_INTR_ENABLE_THRESH` in `hal/rv_utils.h`). This means any
+interrupt with priority ≤ 1 is **masked**. Our SYSTIMER uses priority 2 to be
+strictly above this threshold.
 
 ### Edge vs Level Triggered
 
@@ -114,45 +117,177 @@ never enabled.
 
 ---
 
+## Reserved and Disabled CPU Interrupt Lines
+
+Not all 32 CPU interrupt lines are available for application use on ESP32-C6.
+
+### Hardware-Reserved Lines (CLINT-bound)
+
+From `esp_hw_support/port/esp32c6/esp_cpu_intr.c`:
+```c
+const uint32_t rsvd_mask = BIT(1) | BIT(3) | BIT(4) | BIT(6) | BIT(7);
+```
+
+| Line | Reason |
+|------|--------|
+| 1    | Bound to Wi-Fi MAC (internal use) |
+| 3    | CLINT (Core-Local Interrupt Timer) |
+| 4    | CLINT |
+| 6    | Permanently disabled |
+| 7    | CLINT machine timer (`mtimecmp`/`mtime`) |
+
+**Effect**: The ROM `esprv_intc_int_enable` function silently ignores any bit
+in this mask. Writing the PLIC ENABLE bit directly (bypassing the ROM) also has
+no effect — the hardware physically prevents these lines from being asserted by
+the PLIC.
+
+### Effectively-Disabled Lines (INTMTX routing)
+
+From `esp_hw_support/intr_alloc.c`:
+```
+Muxing an interrupt source to interrupt 6, 7, 11, 15, 16 or 29
+causes the interrupt to effectively be disabled.
+```
+
+These lines exist in the CPU but the INTMTX routing hardware ignores any source
+routed to them. Even if you configure the PLIC for these lines, no peripheral
+source will ever assert them.
+
+### Safe Lines for Application Use
+
+Lines not in either list above. FreeRTOS uses lines 2, 5, 8, 25, 27 (for WDT,
+inter-core, etc.). We use **line 17** for SYSTIMER.
+
+---
+
 ## Layer 3: RISC-V CSR Gates
 
-Two CSR bits must both be set for any interrupt to reach the CPU:
+**Three** CSR conditions must all be true for any external interrupt to reach
+the CPU core on ESP32-C6. Missing any one of them silently prevents the interrupt.
 
-### mstatus.MIE (bit 3)
+### mstatus.MIE (bit 3) — Global Gate
 
-Global machine interrupt enable. Set by ThreadX when threads are running.
-Cleared by `csrci mstatus, 8` during critical sections.
+Global machine interrupt enable. When 0, all interrupts are blocked regardless
+of PLIC or `mie` configuration.
 
-ThreadX manages this automatically via `TX_DISABLE` / `TX_RESTORE` macros
-and via the context restore path (mret restores mstatus from mepc/mstatus
-saved on interrupt entry).
+ThreadX manages this automatically:
+- `TX_DISABLE` (`csrci mstatus, 8`) clears it during critical sections
+- `TX_RESTORE` restores the saved value
+- `mret` at the end of an ISR restores `mstatus.MIE` from the value saved in
+  `mstatus.MPIE` at interrupt entry (hardware does this automatically)
 
-### mie.MEIE (bit 11)
+### mie.MEIE (bit 11) — External Interrupt Gate
 
-Machine External Interrupt Enable. Must be set to allow the PLIC to deliver
-interrupts to the CPU.
+Machine External Interrupt Enable. This is the gate for the entire PLIC
+external interrupt subsystem. When 0, no PLIC interrupt (regardless of priority,
+enable bits, or `mie` per-line bits) reaches the CPU.
 
-**Our previous bug**: ThreadX's port only manages mstatus.MIE, not mie.MEIE.
-Without setting mie.MEIE, no external interrupt (including SYSTIMER) can fire,
-even if mstatus.MIE is set and the PLIC is configured.
+Standard RISC-V designs: setting `mie.MEIE = 1` is sufficient to receive all
+PLIC-enabled external interrupts.
 
 We set this in `_tx_initialize_low_level`:
 ```asm
 li    t0, 0x800      /* bit 11 = MEIE */
-csrs  mie, t0        /* set MEIE in mie CSR */
+csrs  mie, t0        /* atomically OR: mie |= 0x800 */
 ```
 
-The `csrs` instruction atomically sets bits in a CSR:
-- `csrs csr, rs1` — performs `CSR = CSR | rs1`
+### mie Bit N — Per-Line Enable (ESP32-C6 Non-Standard)
 
-### Summary of CSR Bits Used
+This is the **non-standard, undocumented** requirement specific to the ESP32-C6
+PLIC implementation. In addition to `mie.MEIE` (bit 11), the ESP32-C6 PLIC also
+requires `mie bit N` to be set for CPU interrupt line N.
 
-| CSR     | Bit | Name  | Set by us?      | Purpose                        |
-|---------|-----|-------|-----------------|--------------------------------|
-| mstatus | 3   | MIE   | ThreadX         | Global machine interrupt gate  |
-| mie     | 11  | MEIE  | Yes, at init    | Machine external interrupt gate|
-| mie     | 7   | MTIE  | Not used        | Machine timer (mtime) gate     |
-| mie     | 3   | MSIE  | Not used        | Machine software interrupt gate|
+Standard RISC-V: `mie` has named bits for software interrupt (bit 3 MSIE),
+timer interrupt (bit 7 MTIE), and external interrupt (bit 11 MEIE). Bits above
+11 are defined as "platform-specific" by the spec.
+
+ESP32-C6: The PLIC hardware treats `mie bits [31:0]` as an additional per-line
+enable mask. Bit N in `mie` acts as a second enable gate for CPU interrupt line N,
+independent of `PLIC_MXINT_ENABLE_REG bit N`.
+
+**Evidence**: Comparing FreeRTOS working interrupt lines (2, 5, 8, 25, 27) vs
+our line 17, with diagnostic register readbacks:
+
+```
+FreeRTOS line 8 (WDT):
+  PLIC_ENABLE bit 8 = 1  ← set by PLIC
+  mie bit 8       = 1  ← also set
+  → fires correctly
+
+Our line 17 (initial attempt):
+  PLIC_ENABLE bit 17 = 1  ← we set this
+  mie bit 17        = 0  ← NOT set
+  → never fires
+
+Our line 17 (after fix):
+  PLIC_ENABLE bit 17 = 1  ← we set this
+  mie bit 17        = 1  ← we also set this
+  → fires correctly
+```
+
+**Root cause of missing bit**: The ROM function `esprv_intc_int_enable` does
+both writes internally:
+```c
+// Inferred from behavior and ESP-IDF source reading:
+PLIC_MXINT_ENABLE_REG |= mask;   // write PLIC register
+csrs mie, mask;                  // also set mie bits
+```
+
+When we bypassed the ROM function with direct volatile register writes to fix
+the reserved-line issue (Bug 27 Part 1), we wrote `PLIC_MXINT_ENABLE_REG` but
+forgot the `csrs mie` step. The PLIC enable was set; the CPU gate was not.
+
+**Fix**: After writing `PLIC_MXINT_ENABLE_REG`, also explicitly set the per-line
+`mie` bit:
+```c
+PLIC_MX_ENABLE |= (1u << TIMER_CPU_INT_NUM);             /* PLIC enable */
+__asm__ volatile("csrs mie, %0" :: "r"(1u << TIMER_CPU_INT_NUM));  /* mie bit */
+```
+
+### mideleg — Interrupt Mode Delegation
+
+`mideleg` is a CSR controlling whether each interrupt is handled in M-mode
+(machine mode) or delegated to S-mode (supervisor mode). If `mideleg bit N = 1`,
+CPU interrupt line N is handled entirely in S-mode — M-mode handlers are bypassed.
+
+ThreadX runs in M-mode. We must keep `mideleg bit 17 = 0`:
+```c
+__asm__ volatile("csrc mideleg, %0" :: "r"(1u << TIMER_CPU_INT_NUM));
+```
+
+`esp_intr_alloc()` does this same write (`RV_CLEAR_CSR(mideleg, BIT(intr))`)
+for every interrupt it allocates via the ESP-IDF system.
+
+### Complete CSR Picture for Line 17 (SYSTIMER)
+
+```
+mstatus.MIE (bit 3):   managed by ThreadX via TX_DISABLE/TX_RESTORE + mret
+mie.MEIE    (bit 11):  set at init: csrs mie, 0x800
+mie bit 17  (bit 17):  set at init: csrs mie, (1u << 17)  ← ESP32-C6 non-standard
+mideleg bit 17:        cleared at init: csrc mideleg, (1u << 17)
+```
+
+### Summary of All CSR Bits We Touch
+
+| CSR      | Bit | Name        | How we set it          | Purpose                                         |
+|----------|-----|-------------|------------------------|-------------------------------------------------|
+| mstatus  | 3   | MIE         | ThreadX (TX_DISABLE/RESTORE + mret) | Global machine interrupt gate    |
+| mie      | 11  | MEIE        | `csrs mie, 0x800` at init  | All PLIC external interrupts enabled        |
+| mie      | 17  | (per-line)  | `csrs mie, (1u<<17)` at init | ESP32-C6: per-line gate for CPU line 17 |
+| mtvec    | —   | —           | `csrw mtvec, table_addr`   | Points to 256-byte aligned vector table    |
+| mideleg  | 17  | (per-line)  | `csrc mideleg, (1u<<17)` at init | Keep line 17 in M-mode         |
+
+### The `csrs` / `csrc` Instruction
+
+```asm
+csrs csr, rs1   → CSR = CSR | rs1    (set bits — rs1 is a bitmask)
+csrc csr, rs1   → CSR = CSR & ~rs1   (clear bits — rs1 is a bitmask)
+csrw csr, rs1   → CSR = rs1          (write entire CSR value)
+csrr rd, csr    → rd = CSR           (read entire CSR value)
+```
+
+These are atomic read-modify-write operations. They cannot be interrupted
+between the read and write phases.
 
 ---
 
@@ -242,18 +377,24 @@ write_reg(SYSTIMER_INT_CLR_REG, (1 << 0));
 In the ISR, both the SYSTIMER and the PLIC edge latch must be cleared:
 
 ```c
-// Clear SYSTIMER interrupt status (write-trigger)
-write_reg(SYSTIMER_INT_CLR_REG, (1 << 0));
+// Clear SYSTIMER alarm interrupt (stops the peripheral asserting the line)
+systimer_ll_clear_alarm_int(hal->dev, SYSTIMER_ALARM_OS_TICK_CORE0);
 
-// Clear PLIC edge latch for CPU line 7
-write_reg(PLIC_MX_CLEAR_REG, (1u << 7));
+// Clear PLIC edge latch for CPU line 17
+// Required for edge-triggered mode: without this the interrupt re-fires
+// immediately after mret because the latch is still asserted.
+PLIC_MX_CLEAR |= (1u << TIMER_CPU_INT_NUM);   // TIMER_CPU_INT_NUM = 17
 
-// Now call ThreadX tick handler
+// Advance the ThreadX tick counter
 _tx_timer_interrupt();
 ```
 
 If only SYSTIMER is cleared but not PLIC: the edge latch remains set and the
-interrupt will fire again immediately after mret.
+interrupt fires again immediately after `mret`.
 
 If only PLIC is cleared but not SYSTIMER: the SYSTIMER interrupt remains
-asserted and will immediately re-trigger the PLIC.
+asserted and will immediately re-trigger the PLIC edge latch.
+
+**Note**: We previously called `esp_cpu_intr_edge_ack()` for PLIC edge clear,
+but that proxies to the same ROM `esprv_intc_int_clear` function which
+also has the reserved-line masking issue. Direct register write is used instead.
