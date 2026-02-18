@@ -45,10 +45,7 @@ extern VOID _tx_timer_interrupt(VOID);
 /* HAL context — kept alive for ISR use */
 static systimer_hal_context_t s_systimer_hal;
 
-/*
- * Global: CPU interrupt line used for the timer.
- * Read by the assembly trap handler to know which PLIC bit to check.
- */
+/* CPU interrupt line used for the timer (informational; no longer read by assembly). */
 UINT _tx_esp32c6_timer_cpu_int = TIMER_CPU_INT_NUM;
 
 /*

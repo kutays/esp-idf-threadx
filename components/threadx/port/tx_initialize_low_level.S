@@ -44,13 +44,6 @@
     .extern _tx_thread_system_stack_ptr
     .extern _tx_port_setup_timer_interrupt
     .extern _tx_esp32c6_timer_isr
-    .extern _tx_esp32c6_timer_cpu_int
-
-    /*
-     * PLIC machine-mode EIP status register.
-     * DR_REG_PLIC_MX_BASE = 0x20001000, EIP_STATUS at offset 0x0C
-     */
-    .equ PLIC_MX_EIP_STATUS_REG, 0x2000100C
 
     /* Interrupt stack frame size: 32 registers * REGBYTES (no FP on ESP32-C6) */
     .equ INT_FRAME_SIZE, (32 * REGBYTES)
@@ -214,26 +207,23 @@ __tx_free_memory_start:
 /* =========================================================================
  * _tx_esp32c6_trap_handler
  *
- * Unified trap/interrupt handler for ThreadX on ESP32-C6.
+ * SYSTIMER tick handler — reached exclusively via vector[7].
  *
- * Reached via the vector table:
- *   - vector[7]: CPU interrupt line 7 / SYSTIMER tick (mcause bit 31 = 1)
+ * In vectored mode the CPU dispatches interrupt N to vector[N], and
+ * exceptions to vector[0]. Because vector[7] is our SYSTIMER entry, we
+ * know unconditionally that this is the SYSTIMER tick. No mcause check
+ * and no PLIC EIP_STATUS check are needed.
  *
- * MUST be in .iram0.text — the vector table entries are 4-byte `j` (JAL)
- * instructions with ±1MB range. IRAM is ~0x40800000, flash is ~0x42000000,
- * so the handler must be in IRAM for the vector table jump to reach it.
+ * (Previous design read PLIC_MX_EIP_STATUS before calling the ISR. On
+ *  ESP32-C6 for edge-triggered interrupts, the PLIC clears the EIP bit
+ *  when the CPU takes the interrupt — so the bit was always 0 by the time
+ *  we read it and the ISR was silently skipped every single time.)
  *
- * The ThreadX context save/restore calling convention requires:
- *   1. Allocate interrupt stack frame (32 * REGBYTES = 128 bytes on RV32)
- *   2. Save x1 (RA) at offset 28*REGBYTES into the frame
- *      (context_save will overwrite it via its own 'call' prologue)
- *   3. Call _tx_thread_context_save (saves all other scratch regs + mepc)
- *   4. Handle the interrupt
- *   5. Jump to _tx_thread_context_restore (does NOT return — ends with mret)
+ * MUST be in .iram0.text — the vector table `j` entries have ±1MB range.
+ * IRAM ~0x40800000 to flash ~0x42000000 is ~32 MB — exceeds JAL range.
  *
- * Note on _tx_thread_context_restore: it lives in flash (.text). We cannot
- * reach it with a plain `j` (JAL, ±1MB) from IRAM. We use `la + jr`
- * (register-indirect jump) which has unlimited range.
+ * _tx_thread_context_restore is in flash (.text); reach it with la+jr
+ * (unlimited range) instead of j (±1 MB).
  * ========================================================================= */
     .section .iram0.text,"ax",@progbits
     .align 4
@@ -249,42 +239,12 @@ _tx_esp32c6_trap_handler:
     /* Step 3: Save context (stores all scratch regs, mepc, handles nesting) */
     call    _tx_thread_context_save
 
-    /* Now running on system stack (if first interrupt) or same stack (if nested) */
-
-    /* Read mcause to determine interrupt vs exception.
-     * Exceptions should not reach here — they go via vector[0] to
-     * _tx_esp32c6_exception_entry which calls abort(). If we somehow
-     * arrive here for an exception, redirect. */
-    csrr    t0, mcause
-    bltz    t0, _handle_interrupt     /* bit 31 set = interrupt */
-    j       _tx_esp32c6_exception_entry /* exception: should not happen */
-
-_handle_interrupt:
-    /*
-     * External interrupt. Read the PLIC machine-mode EIP status register
-     * to find which CPU interrupt line fired.
-     */
-    li      t1, PLIC_MX_EIP_STATUS_REG
-    lw      t2, 0(t1)
-
-    /*
-     * Check if our SYSTIMER CPU interrupt bit is set.
-     * Load the configured interrupt number and create bit mask.
-     */
-    la      t3, _tx_esp32c6_timer_cpu_int
-    lw      t3, 0(t3)
-    li      t4, 1
-    sll     t4, t4, t3          /* t4 = (1 << cpu_int_num) */
-    and     t5, t2, t4
-    beqz    t5, _int_done       /* not our timer interrupt */
-
-    /* Call the ThreadX timer ISR (clears interrupt + calls _tx_timer_interrupt) */
+    /* Step 4: Run the SYSTIMER ISR — clears the alarm and calls
+     *         _tx_timer_interrupt() to advance the ThreadX tick. */
     call    _tx_esp32c6_timer_isr
 
-_int_done:
-    /* Step 5: Restore context — this does NOT return (ends with mret).
-     * _tx_thread_context_restore is in flash (.text). We cannot use `j`
-     * (JAL, ±1MB) from IRAM. Use la+jr for unlimited-range tail-call. */
+    /* Step 5: Restore context — does NOT return (ends with mret).
+     * la+jr gives unlimited range for the IRAM → flash jump. */
     la      t0, _tx_thread_context_restore
     jr      t0
 
