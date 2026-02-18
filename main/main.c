@@ -9,6 +9,9 @@
 #include "tx_api.h"
 #include "esp_log.h"
 
+/* Diagnostic counter defined in tx_esp32c6_timer.c */
+extern volatile uint32_t g_tx_timer_isr_count;
+
 static const char *TAG = "main";
 
 /* Second test thread */
@@ -25,8 +28,12 @@ static void blink_thread_entry(ULONG param)
     ULONG count = 0;
 
     while (1) {
-        ESP_LOGI(TAG, "[blink] tick=%lu  count=%lu", tx_time_get(), count++);
-        tx_thread_sleep(100);  /* ~1 second at 100 Hz */
+        /* Busy-wait ~50ms using a raw spin loop (no sleep) so we keep printing
+         * even if tx_thread_sleep is broken. Spin count tuned for ~160 MHz. */
+        for (volatile uint32_t i = 0; i < 2000000UL; i++);
+        ESP_LOGI(TAG, "[blink] tick=%lu  isr_count=%lu  count=%lu",
+                 tx_time_get(), (ULONG)g_tx_timer_isr_count, count++);
+        tx_thread_relinquish();   /* yield — let main run */
     }
 }
 
@@ -57,12 +64,14 @@ void app_main(void)
     }
 
         ESP_LOGE(TAG, "Thread created: %u", status);
-    /* Main thread loop */
+    /* Main thread loop — busy-wait, no sleep, so we keep printing
+     * regardless of whether the tick timer works. */
     ULONG count = 0;
-    
     while (1) {
-        ESP_LOGI(TAG, "[main]  tick=%lu  count=%lu", tx_time_get(), count++);
-        tx_thread_sleep(200);  /* ~2 seconds */
+        for (volatile uint32_t i = 0; i < 4000000UL; i++);
+        ESP_LOGI(TAG, "[main]  tick=%lu  isr_count=%lu  count=%lu",
+                 tx_time_get(), (ULONG)g_tx_timer_isr_count, count++);
+        tx_thread_relinquish();
     }
     
 }

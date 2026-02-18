@@ -24,9 +24,11 @@
  *   address in mtvec DOES NOT WORK — interrupts jump into the middle of
  *   the handler code rather than the entry point.
  *
- *   We use CPU interrupt line 7 for SYSTIMER, so:
- *     vector[0] → _tx_esp32c6_exception_entry (CPU exception → abort())
- *     vector[7] → _tx_esp32c6_trap_handler    (SYSTIMER tick)
+ *   Lines 1, 3, 4, 6, 7 are RESERVED on ESP32-C6 (CLINT/Wi-Fi bound).
+ *   Lines 6, 7, 11, 15, 16, 29 are "effectively disabled" by the INTMTX hardware.
+ *   We use CPU interrupt line 17 for SYSTIMER:
+ *     vector[0]  → _tx_esp32c6_exception_entry (CPU exception → abort())
+ *     vector[17] → _tx_esp32c6_trap_handler    (SYSTIMER tick)
  *
  * ESP32-C6 uses SOC_INT_PLIC_SUPPORTED. Machine-mode external interrupts
  * are routed through the PLIC at 0x20001000. The mie.MEIE CSR bit (bit 11)
@@ -75,18 +77,18 @@ _tx_esp32c6_vector_table:
     j   _tx_esp32c6_unused_int      /* 3: unused CPU interrupt */
     j   _tx_esp32c6_unused_int      /* 4: unused CPU interrupt */
     j   _tx_esp32c6_unused_int      /* 5: unused CPU interrupt */
-    j   _tx_esp32c6_unused_int      /* 6: unused CPU interrupt */
-    j   _tx_esp32c6_trap_handler    /* 7: SYSTIMER tick (CPU interrupt line 7) */
+    j   _tx_esp32c6_unused_int      /* 6: reserved (permanently disabled) */
+    j   _tx_esp32c6_unused_int      /* 7: reserved (CLINT machine timer) */
     j   _tx_esp32c6_unused_int      /* 8: unused */
     j   _tx_esp32c6_unused_int      /* 9: unused */
     j   _tx_esp32c6_unused_int      /* 10: unused */
-    j   _tx_esp32c6_unused_int      /* 11: unused */
+    j   _tx_esp32c6_unused_int      /* 11: unused (effectively disabled) */
     j   _tx_esp32c6_unused_int      /* 12: unused */
     j   _tx_esp32c6_unused_int      /* 13: unused */
     j   _tx_esp32c6_unused_int      /* 14: unused */
-    j   _tx_esp32c6_unused_int      /* 15: unused */
-    j   _tx_esp32c6_unused_int      /* 16: unused */
-    j   _tx_esp32c6_unused_int      /* 17: unused */
+    j   _tx_esp32c6_unused_int      /* 15: unused (effectively disabled) */
+    j   _tx_esp32c6_unused_int      /* 16: unused (effectively disabled) */
+    j   _tx_esp32c6_trap_handler    /* 17: SYSTIMER tick (CPU interrupt line 17) */
     j   _tx_esp32c6_unused_int      /* 18: unused */
     j   _tx_esp32c6_unused_int      /* 19: unused */
     j   _tx_esp32c6_unused_int      /* 20: unused */
