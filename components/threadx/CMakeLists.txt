@@ -3,6 +3,11 @@
 # Builds the ThreadX kernel from the git submodule (threadx/) plus
 # our ESP32-C6 port files (port/).
 
+if(NOT CONFIG_RTOS_SELECTION_THREADX)
+    idf_component_register()
+    return()
+endif()
+
 set(THREADX_DIR ${CMAKE_CURRENT_SOURCE_DIR}/threadx)
 set(PORT_DIR    ${CMAKE_CURRENT_SOURCE_DIR}/port)
 

@@ -1,30 +1,58 @@
+menu "RTOS Selection"
+    depends on IDF_TARGET_ESP32C6
+
+    choice RTOS_SELECTION
+        prompt "Select RTOS"
+        default RTOS_SELECTION_THREADX
+        help
+            Select which RTOS to use. ThreadX is only available on ESP32-C6.
+            FreeRTOS is the safe default — all ESP-IDF components work normally.
+            When ThreadX is selected, it hooks into ESP-IDF startup via
+            port_start_app_hook() and the FreeRTOS scheduler never starts.
+
+        config RTOS_SELECTION_FREERTOS
+            bool "FreeRTOS (ESP-IDF default)"
+            help
+                Standard ESP-IDF FreeRTOS. All ESP-IDF WiFi, BT, and driver
+                components work normally.
+
+        config RTOS_SELECTION_THREADX
+            bool "ThreadX (Azure RTOS, ESP32-C6 only)"
+            help
+                Azure RTOS ThreadX. The FreeRTOS compatibility layer
+                (tx_freertos.c) is available for components that use FreeRTOS APIs.
+                Note: WiFi/BT stack compatibility is not fully validated.
+    endchoice
+
+endmenu
+
 menu "ThreadX Configuration"
+    depends on RTOS_SELECTION_THREADX
 
     config THREADX_TICK_RATE_HZ
-        int "ThreadX tick rate (Hz)"
+        int "Tick rate (Hz)"
         default 100
+        range 10 1000
         help
-            Number of ThreadX timer ticks per second.
+            Number of ThreadX timer ticks per second. Sets TX_TIMER_TICKS_PER_SECOND.
+            The SYSTIMER alarm period is 1,000,000 / tick_rate microseconds.
+            100 Hz = 10ms tick (recommended). 1000 Hz = 1ms tick (high CPU overhead).
 
     config THREADX_MAX_PRIORITIES
         int "Maximum thread priority levels"
         default 32
+        range 8 256
         help
-            Maximum number of ThreadX priority levels (0 = highest).
+            Sets TX_MAX_PRIORITIES. Lower number = higher priority in ThreadX.
+            Increasing this uses more RAM (one pointer per priority level).
 
     config THREADX_BYTE_POOL_SIZE
         int "System byte pool size (bytes)"
         default 32768
+        range 4096 131072
         help
             Size of the system byte pool used for dynamic allocations
-            including FreeRTOS compatibility layer objects.
-
-    config THREADX_TIMER_CPU_INT
-        int "CPU interrupt number for SYSTIMER"
-        default 7
-        range 1 31
-        help
-            CPU interrupt line to use for the SYSTIMER tick interrupt.
-            Must not conflict with other ESP-IDF interrupt allocations.
+            via tx_byte_allocate(). Used by the FreeRTOS compatibility layer
+            for xTaskCreate, xQueueCreate, etc.
 
 endmenu

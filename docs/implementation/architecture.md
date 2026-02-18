@@ -129,6 +129,105 @@ At 100 Hz tick rate: 100 ticks = 1 second, 200 ticks = 2 seconds.
 ThreadX critical code paths (scheduler, context switch, ISR entry/exit) are
 placed in IRAM via `linker.lf` to avoid flash access latency during interrupts.
 
+---
+
+## 7. Project Layout and Examples Structure
+
+The repository is structured so that `components/` are shared across multiple
+independent example projects under `examples/`. Each example is a standalone
+ESP-IDF project — buildable independently with its own menuconfig, sdkconfig,
+and build directory.
+
+```
+threadx-esp32c6-project/
+│
+├── components/                      ← shared components (used by all examples)
+│   ├── threadx/                     ← ThreadX kernel + ESP32-C6 port
+│   │   ├── Kconfig                  ← RTOS selection + ThreadX config
+│   │   ├── CMakeLists.txt           ← early-return guard when FREERTOS selected
+│   │   ├── include/tx_user.h        ← ThreadX config overrides (uses CONFIG_* macros)
+│   │   ├── port/                    ← ESP32-C6-specific port files
+│   │   │   ├── tx_initialize_low_level.S   ← vector table, timer setup
+│   │   │   ├── tx_esp32c6_timer.c          ← SYSTIMER + PLIC configuration
+│   │   │   └── tx_port_startup.c           ← port_start_app_hook, tx_application_define
+│   │   └── threadx/                 ← git submodule (upstream Azure RTOS ThreadX)
+│   │       ├── common/src/          ← kernel sources
+│   │       ├── ports/risc-v64/gnu/  ← RISC-V port assembly
+│   │       └── utility/rtos_compatibility_layers/FreeRTOS/  ← compat layer
+│   │
+│   └── freertos_compat/             ← FreeRTOS API shim on top of ThreadX
+│       ├── CMakeLists.txt           ← early-return guard when FREERTOS selected
+│       ├── include/                 ← FreeRTOSConfig.h, portmacro.h overrides
+│       └── src/port.c               ← newlib lock bridges, ESP-IDF integration
+│
+├── examples/
+│   ├── threadx_demo/                ← native ThreadX API application
+│   │   ├── CMakeLists.txt           ← EXTRA_COMPONENT_DIRS → ../../components/
+│   │   ├── sdkconfig.defaults       ← CONFIG_RTOS_SELECTION_THREADX=y
+│   │   └── main/
+│   │       ├── CMakeLists.txt       ← REQUIRES threadx freertos_compat
+│   │       └── main.c               ← uses tx_thread_create, tx_thread_sleep, etc.
+│   │
+│   └── freertos_demo/               ← FreeRTOS API application
+│       ├── CMakeLists.txt           ← EXTRA_COMPONENT_DIRS → ../../components/
+│       ├── sdkconfig.defaults       ← CONFIG_RTOS_SELECTION_FREERTOS=y (default)
+│       └── main/
+│           ├── CMakeLists.txt       ← conditional REQUIRES freertos_compat
+│           └── main.c               ← uses xTaskCreate, vTaskDelay, etc.
+│                                       works unchanged with EITHER RTOS selected
+│
+└── main/                            ← root project stub (placeholder only)
+    ├── CMakeLists.txt
+    └── main.c                       ← redirects user to examples/
+```
+
+### How the RTOS Selection Propagates Through the Build
+
+When you run `idf.py menuconfig` from within an example directory and select
+an RTOS, the following chain happens:
+
+```
+menuconfig writes → sdkconfig
+sdkconfig read by → ESP-IDF cmake → sdkconfig.cmake (sets CONFIG_* CMake variables)
+sdkconfig.cmake sets → CONFIG_RTOS_SELECTION_THREADX (or FREERTOS)
+CMakeLists.txt reads → CONFIG_RTOS_SELECTION_THREADX in if() guards
+  → threadx/CMakeLists.txt:    if(NOT CONFIG_RTOS_SELECTION_THREADX) → early return or full build
+  → freertos_compat/CMakeLists.txt: same
+  → main/CMakeLists.txt (freertos_demo): conditional REQUIRES
+sdkconfig.h (compile flag -include sdkconfig.h) → makes CONFIG_* available in C/C++
+  → tx_user.h reads CONFIG_THREADX_TICK_RATE_HZ, CONFIG_THREADX_MAX_PRIORITIES
+  → tx_port_startup.c reads CONFIG_THREADX_BYTE_POOL_SIZE
+```
+
+Each example has its own independent `sdkconfig` file (created in its own
+`build/` subdirectory). Changing RTOS selection in `examples/threadx_demo`
+has no effect on `examples/freertos_demo`.
+
+### Upgrade Path: From EXTRA_COMPONENT_DIRS to Managed Components
+
+The current structure uses `EXTRA_COMPONENT_DIRS` in each example's top-level
+`CMakeLists.txt` to reference the shared components. This is an interim approach
+suitable for a monorepo layout.
+
+The future goal is to publish `threadx` and `freertos_compat` as proper
+**ESP-IDF managed components** (via the IDF Component Manager). Once published:
+
+```yaml
+# idf_component.yml — replaces EXTRA_COMPONENT_DIRS in each example
+dependencies:
+  threadx:
+    version: ">=1.0.0"
+  freertos_compat:
+    version: ">=1.0.0"
+```
+
+With managed components, any ESP-IDF project anywhere — not just within this
+repository — could add ThreadX support by adding the `idf_component.yml` file.
+The `EXTRA_COMPONENT_DIRS` lines in each `CMakeLists.txt` would be deleted,
+and no repository structure constraints would be imposed on users.
+
+---
+
 ## 6. Interrupt Flow at Runtime
 
 ```

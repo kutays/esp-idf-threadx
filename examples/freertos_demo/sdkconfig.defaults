@@ -15,8 +15,11 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# Disable FreeRTOS idle task watchdog
+# FreeRTOS tick rate
 CONFIG_FREERTOS_HZ=100
 
-# RTOS selection — ThreadX by default for this project
-CONFIG_RTOS_SELECTION_THREADX=y
+# Select FreeRTOS as the RTOS for this demo (default).
+# Switch to CONFIG_RTOS_SELECTION_THREADX=y (via menuconfig or editing this
+# file) to run the same code through the FreeRTOS compatibility layer on
+# top of ThreadX — no changes to main.c required.
+CONFIG_RTOS_SELECTION_FREERTOS=y

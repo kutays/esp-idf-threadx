@@ -43,7 +43,7 @@ static const char *TAG = "threadx_startup";
 extern void app_main(void);
 
 /* System byte pool for dynamic allocations */
-#define SYSTEM_BYTE_POOL_SIZE   (32 * 1024)
+#define SYSTEM_BYTE_POOL_SIZE   CONFIG_THREADX_BYTE_POOL_SIZE
 static TX_BYTE_POOL system_byte_pool;
 static UCHAR system_byte_pool_storage[SYSTEM_BYTE_POOL_SIZE];
 

@@ -1588,3 +1588,339 @@ For cooperative multitasking between threads of **different priorities**, always
 priority level.
 
 ---
+
+## Menuconfig RTOS Selection + Kconfig Parameter Wiring
+
+**Phase**: Post-working-system housekeeping. ThreadX fully operational (Bugs 1–29
+resolved). Goal: make the RTOS choice user-selectable via `idf.py menuconfig` and
+wire the four Kconfig parameters to actual source code instead of hardcoded values.
+
+### Changes Implemented
+
+#### 1. New Kconfig: RTOS Selection Choice
+
+`components/threadx/Kconfig` was completely replaced. Previously contained only a
+`menu "ThreadX Configuration"` with four hardcoded parameters (one with a wrong
+default). Replaced with:
+
+- **`menu "RTOS Selection"` with `depends on IDF_TARGET_ESP32C6`**: The entire
+  menu only appears when targeting ESP32-C6, preventing accidental selection on
+  unsupported targets.
+
+- **`choice RTOS_SELECTION`**: Two options — `RTOS_SELECTION_FREERTOS` (standard
+  ESP-IDF FreeRTOS) and `RTOS_SELECTION_THREADX` (Azure RTOS, ESP32-C6 only).
+  Default: `RTOS_SELECTION_THREADX` (preserves current project behavior; also
+  used as the kconfig fallback when an existing sdkconfig lacks this new choice,
+  see Bug 30 below).
+
+- **`menu "ThreadX Configuration"` with `depends on RTOS_SELECTION_THREADX`**: The
+  three wirable parameters only appear when ThreadX is selected.
+
+- **`THREADX_TIMER_CPU_INT` removed entirely**: This parameter had the wrong default
+  (7 instead of 17) and cannot be wired to the assembly vector table — the `j`
+  instruction at `vector[17]` in `tx_initialize_low_level.S` is a fixed assembler
+  offset. Making it configurable would require fragile `.rept` tricks. CPU line 17
+  is the correct fixed choice by hardware analysis (Bug 27). The parameter was a
+  misleading dead config.
+
+- **Ranges added**: `THREADX_TICK_RATE_HZ` 10–1000, `THREADX_MAX_PRIORITIES` 8–256,
+  `THREADX_BYTE_POOL_SIZE` 4096–131072. Prevents nonsensical values from compiling.
+
+#### 2. tx_user.h — Wire Tick Rate and Max Priorities
+
+`components/threadx/include/tx_user.h` changed two hardcoded constants to
+`CONFIG_*` macros:
+
+```c
+/* Before: */
+#define TX_TIMER_TICKS_PER_SECOND       100
+#define TX_MAX_PRIORITIES               32
+
+/* After: */
+#define TX_TIMER_TICKS_PER_SECOND       CONFIG_THREADX_TICK_RATE_HZ
+#define TX_MAX_PRIORITIES               CONFIG_THREADX_MAX_PRIORITIES
+```
+
+ESP-IDF automatically adds `-include sdkconfig.h` to every compiled translation
+unit, so `CONFIG_THREADX_TICK_RATE_HZ` is available in tx_user.h without an
+explicit `#include "sdkconfig.h"`.
+
+The unused `TX_BYTE_POOL_SIZE_DEFAULT (32*1024)` macro was also removed — it was
+never referenced anywhere in the codebase and predated the Kconfig parameter.
+
+#### 3. tx_port_startup.c — Wire Byte Pool Size
+
+`components/threadx/port/tx_port_startup.c`:
+
+```c
+/* Before: */
+#define SYSTEM_BYTE_POOL_SIZE   (32 * 1024)
+
+/* After: */
+#define SYSTEM_BYTE_POOL_SIZE   CONFIG_THREADX_BYTE_POOL_SIZE
+```
+
+#### 4. CMakeLists.txt Early-Return Guards
+
+`components/threadx/CMakeLists.txt` and `components/freertos_compat/CMakeLists.txt`
+each received an early-return guard at the top:
+
+```cmake
+if(NOT CONFIG_RTOS_SELECTION_THREADX)
+    idf_component_register()
+    return()
+endif()
+```
+
+When FreeRTOS mode is selected, both components register as empty interface targets
+and return immediately. Zero ThreadX sources compile. The rest of each CMakeLists.txt
+(source lists, `idf_component_register` with full SRCS, `target_*` calls) executes
+only in ThreadX mode.
+
+#### 5. main/CMakeLists.txt — Conditional REQUIRES
+
+```cmake
+if(CONFIG_RTOS_SELECTION_THREADX)
+    idf_component_register(SRCS "main.c" INCLUDE_DIRS "." REQUIRES threadx freertos_compat)
+else()
+    idf_component_register(SRCS "main.c" INCLUDE_DIRS ".")
+endif()
+```
+
+In FreeRTOS mode, `main` does not depend on `threadx` or `freertos_compat`
+(both empty). This avoids spurious include-path requests to empty components.
+
+#### 6. main/main.c — Dual-Mode Demo
+
+The entire file is wrapped in `#ifdef CONFIG_RTOS_SELECTION_THREADX` / `#else` /
+`#endif`. The `#else` branch contains a minimal FreeRTOS demo (two tasks using
+`xTaskCreate`, `vTaskDelay`, `xTaskGetTickCount`) so the project compiles and runs
+in either mode without modification.
+
+The `extern volatile uint32_t g_tx_timer_isr_count` declaration moved inside the
+`#ifdef` block — it references a symbol in `tx_esp32c6_timer.c` which is not linked
+in FreeRTOS mode; leaving it outside would cause a link error.
+
+#### 7. sdkconfig.defaults — Preserve Current Behavior
+
+`CONFIG_RTOS_SELECTION_THREADX=y` added to `sdkconfig.defaults`. This ensures fresh
+sdkconfig creation (e.g. after `idf.py fullclean`) selects ThreadX without requiring
+`idf.py menuconfig`.
+
+---
+
+## Bug 30: component_requirements.py BUG — Nested `threadx/threadx/` Directory Breaks REQUIRES Include Propagation
+
+**Phase**: Immediately after the menuconfig/Kconfig changes above were applied.
+
+**Symptom**:
+
+```
+/home/kty/work/threadx-esp32c6-project/components/freertos_compat/src/port.c:11:10:
+fatal error: tx_api.h: No such file or directory
+   11 | #include <tx_api.h>
+      |          ^~~~~~~~~~
+compilation terminated.
+[1191/1204] Building C object esp-idf/threadx/CMakeFiles/__idf_threadx.dir/port/tx_esp32c6_timer.c.obj
+ninja: build stopped: subcommand failed.
+BUG: component_requirements.py: cannot match original component filename for source component threadx
+ninja failed with exit code 1
+```
+
+Two facts stand out:
+1. `tx_esp32c6_timer.c` IS being compiled (ThreadX mode is active, early return did NOT fire)
+2. Yet `tx_api.h` is not found in `freertos_compat/src/port.c`
+
+This means: `CONFIG_RTOS_SELECTION_THREADX=y`, the threadx component is building
+fully, but the `REQUIRES threadx` in `freertos_compat/CMakeLists.txt` is NOT
+propagating threadx's public `INCLUDE_DIRS` to freertos_compat's compile command.
+
+**Root Cause: Pre-Existing ESP-IDF Bug Triggered by Kconfig Change**
+
+The ESP-IDF build system calls `component_requirements.py` (a Python script in
+`${IDF_PATH}/tools/`) during CMake configuration to process the component
+dependency graph and set up include-path propagation. This script had a pre-existing
+bug with our component structure.
+
+The `threadx` component directory is `components/threadx/`. Inside it, the git
+submodule is at `components/threadx/threadx/` — the **same name as the component
+itself**. When `component_requirements.py` tries to match the component named
+"threadx" to its source files/directory, the nested `threadx/threadx/` path is
+ambiguous. The script throws a Python exception:
+
+```
+cannot match original component filename for source component threadx
+```
+
+The exception is caught by idf.py and printed as a "BUG:" message. However, the
+failed match means the dependency graph entry for `threadx` is incomplete. The
+include-directory propagation from `threadx` to `freertos_compat` (via
+`REQUIRES threadx`) is never established. freertos_compat's compile command has
+no `-I .../threadx/common/inc` flag, so `tx_api.h` is not found.
+
+**Why was this not triggered before?**
+
+The script is called during CMake configuration, which only fully re-runs when
+CMakeLists.txt or Kconfig files change. The pre-existing codebase had stable
+Kconfig content. Our change (adding the `RTOS_SELECTION` choice to `Kconfig`)
+triggered a CMake re-run for the first time since the `threadx/threadx/`
+submodule structure was established. This was the first time `component_requirements.py`
+was called with this component layout.
+
+The `BUG:` message appears AFTER "ninja failed" in the output because idf.py
+also runs the script as a post-processing step when reporting errors — but the
+damage is done during the CMake configuration phase that precedes ninja.
+
+**Fix: Explicit `target_include_directories` in freertos_compat**
+
+Added to `components/freertos_compat/CMakeLists.txt`, after `idf_component_register`:
+
+```cmake
+# Workaround: explicitly re-export threadx's public include dirs.
+# Normally REQUIRES threadx propagates them, but component_requirements.py has
+# a pre-existing bug when the component name matches its own submodule directory
+# (components/threadx/threadx/).  A Kconfig change triggers the CMake re-run
+# that first calls the script, breaking transitive include propagation.
+# Adding the paths explicitly here makes REQUIRES irrelevant for this purpose.
+idf_component_get_property(threadx_dir threadx COMPONENT_DIR)
+target_include_directories(${COMPONENT_LIB} PUBLIC
+    "${threadx_dir}/threadx/common/inc"
+    "${threadx_dir}/threadx/ports/risc-v64/gnu/inc"
+    "${threadx_dir}/include"
+)
+```
+
+`idf_component_get_property(threadx_dir threadx COMPONENT_DIR)` returns the
+threadx component's source directory (`components/threadx/`). The three paths
+appended are identical to those registered in threadx's `idf_component_register`
+`INCLUDE_DIRS`. By adding them explicitly via `target_include_directories`, the
+include propagation bypasses `component_requirements.py` entirely and works
+correctly regardless of whether the script succeeds.
+
+**Additional fix: Kconfig default changed from FREERTOS to THREADX**
+
+A secondary symptom of the same Kconfig change: on projects with an existing
+`sdkconfig` (which predates the new `RTOS_SELECTION` choice), ESP-IDF assigns
+new Kconfig options using their declared `default`. If that default was
+`RTOS_SELECTION_FREERTOS`, the existing sdkconfig would be updated to select
+FreeRTOS mode. The early-return guards would then fire for both components,
+registering them as empty — but stale ninja build rules from the previous
+ThreadX build would still reference `freertos_compat/src/port.c`, leading to
+the same `tx_api.h` not found error (now without even an obvious explanation).
+
+Changing the Kconfig default from `RTOS_SELECTION_FREERTOS` to
+`RTOS_SELECTION_THREADX` ensures that existing sdkconfigs encountering the new
+choice for the first time default to ThreadX, preserving the project's intended
+behavior.
+
+**After-action: full clean required**
+
+After any Kconfig structure change (adding/removing/renaming choices), a full
+clean build is recommended to eliminate stale CMake cache and ninja rule
+artifacts:
+
+```bash
+idf.py fullclean && idf.py build
+```
+
+`idf.py fullclean` deletes the entire `build/` directory, forcing a fresh CMake
+configuration pass and complete recompilation. This eliminates stale ninja rules
+that reference sources no longer part of a component's build.
+
+---
+
+## Bug 31: `TX_THREAD` Has No Member `txfr_thread_ptr` — Compile Definition Propagation Also Broken
+
+**Phase**: Immediately after Bug 30 fix (explicit include dirs added). The
+`tx_api.h` include error is gone; compilation reaches `tx_freertos.c` and
+immediately fails with a new error.
+
+**Symptom** (10 instances of the same error across tx_freertos.c):
+
+```
+tx_freertos.c:228:29: error: 'TX_THREAD' {aka 'struct TX_THREAD_STRUCT'} has no member
+named 'txfr_thread_ptr'; did you mean 'tx_thread_id'?
+  228 |     p_txfr_task = p_thread->txfr_thread_ptr;
+```
+
+**Root Cause: Same component_requirements.py BUG, second symptom**
+
+Bug 30 documented that `component_requirements.py` failing breaks transitive
+propagation from `threadx` to `freertos_compat` via `REQUIRES`. The Bug 30 fix
+added explicit `target_include_directories` for the include paths, which resolved
+the `tx_api.h` not found error. But the same broken propagation also affects
+**compile definitions**.
+
+The `threadx/CMakeLists.txt` defines:
+
+```cmake
+target_compile_definitions(${COMPONENT_LIB} PUBLIC TX_INCLUDE_USER_DEFINE_FILE)
+```
+
+This is declared `PUBLIC`, meaning it should propagate to any component with
+`REQUIRES threadx`. When the dependency graph is complete, freertos_compat
+would inherit `-DTX_INCLUDE_USER_DEFINE_FILE` on its compile command.
+
+When `component_requirements.py` fails, the dependency graph entry for threadx
+is incomplete. The `TX_INCLUDE_USER_DEFINE_FILE` flag never reaches freertos_compat.
+
+**The effect of missing TX_INCLUDE_USER_DEFINE_FILE**:
+
+In ThreadX's `tx_api.h`:
+
+```c
+/* Determine if the user extension file should be used. */
+#ifdef TX_INCLUDE_USER_DEFINE_FILE
+#include "tx_user.h"    /* ← only included if the flag is defined */
+#endif
+```
+
+Without `-DTX_INCLUDE_USER_DEFINE_FILE`, `tx_user.h` is never included.
+Without `tx_user.h`, `TX_THREAD_USER_EXTENSION` is never defined.
+Without `TX_THREAD_USER_EXTENSION`, the `TX_THREAD_STRUCT` definition (in `tx_thread.h`)
+never gains the extra field:
+
+```c
+/* From tx_thread.h — the struct definition: */
+struct TX_THREAD_STRUCT {
+    ...
+#ifdef TX_THREAD_USER_EXTENSION
+    TX_THREAD_USER_EXTENSION         /* expands to: VOID *txfr_thread_ptr; */
+#endif
+    ...
+};
+```
+
+So `TX_THREAD` is compiled without `txfr_thread_ptr`. Every access to that field
+in `tx_freertos.c` fails with "has no member named 'txfr_thread_ptr'".
+
+**This is Bug 8 re-appearing**: The first time `txfr_thread_ptr` was missing (Bug 8,
+early development), the fix was adding `TX_THREAD_USER_EXTENSION VOID *txfr_thread_ptr;`
+to `tx_user.h`. The definition is still there and correct. But now the mechanism
+that causes `tx_user.h` to be included (`TX_INCLUDE_USER_DEFINE_FILE`) is not
+reaching `tx_freertos.c` due to the broken dependency propagation.
+
+**Fix**: Add explicit `target_compile_definitions` in `freertos_compat/CMakeLists.txt`,
+alongside the existing explicit `target_include_directories` workaround:
+
+```cmake
+# Without this, tx_api.h never #includes tx_user.h, TX_THREAD_USER_EXTENSION
+# is never defined, and txfr_thread_ptr is absent from TX_THREAD.
+target_compile_definitions(${COMPONENT_LIB} PUBLIC TX_INCLUDE_USER_DEFINE_FILE)
+```
+
+This mirrors what threadx's CMakeLists.txt already does for its own sources —
+we're just replicating the PUBLIC definition in freertos_compat since the automatic
+propagation path is broken.
+
+**Pattern established**: The `component_requirements.py` bug breaks ALL transitive
+propagation from threadx to freertos_compat. Any PUBLIC property on the threadx
+component target (include dirs, compile definitions, link options) must be
+explicitly re-declared in freertos_compat. To date, two properties are affected:
+
+| Property | threadx declares | freertos_compat workaround |
+|---|---|---|
+| Include dirs (`common/inc`, `ports/risc-v64/gnu/inc`, `include/`) | `INCLUDE_DIRS` in `idf_component_register` | `target_include_directories` via `idf_component_get_property` |
+| Compile definition `TX_INCLUDE_USER_DEFINE_FILE` | `target_compile_definitions PUBLIC` | `target_compile_definitions PUBLIC` |
+
+---
