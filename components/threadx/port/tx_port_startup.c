@@ -34,6 +34,7 @@
  *           → main_thread runs app_main()
  */
 
+#include <stdint.h>
 #include "tx_api.h"
 #include "esp_log.h"
 
@@ -41,6 +42,30 @@ static const char *TAG = "threadx_startup";
 
 /* Provided by the application (main.c) */
 extern void app_main(void);
+
+/* FreeRTOS compat layer init (from tx_freertos.c).
+ * Must be called after kernel init — creates heap pool and idle task. */
+extern UINT tx_freertos_init(void);
+
+/* Scheduler state flag (defined in tx_freertos.c).
+ * Must be set to 1 before the scheduler starts so that
+ * xTaskGetSchedulerState() returns RUNNING (not NOT_STARTED)
+ * once threads are actually executing. */
+extern UINT txfr_scheduler_started;
+
+/* ESP-IDF interrupt dispatch state (defined in rtos_int_hooks.S).
+ * port_xSchedulerRunning must be set to 1 when the scheduler is active
+ * so rtos_int_enter/rtos_int_exit perform ISR stack switching.
+ * pxCurrentTCBs must point to a structure whose offset 0 is the saved SP.
+ * rtos_int_enter saves SP to pxCurrentTCBs[0]->offset0 and switches to
+ * the ISR stack; rtos_int_exit restores SP from there. */
+extern volatile uint32_t port_xSchedulerRunning;
+extern volatile uint32_t *pxCurrentTCBs;
+
+/* Simple "fake TCB" — just a single word holding the saved SP.
+ * pxCurrentTCBs points here. rtos_int_enter stores SP at offset 0,
+ * rtos_int_exit loads it back. Single-core, so one word suffices. */
+static uint32_t s_current_task_sp_save;
 
 /* System byte pool for dynamic allocations */
 #define SYSTEM_BYTE_POOL_SIZE   CONFIG_THREADX_BYTE_POOL_SIZE
@@ -94,6 +119,17 @@ void tx_application_define(void *first_unused_memory)
     }
     _tx_esp32c6_system_byte_pool = &system_byte_pool;
 
+    /* Initialize FreeRTOS compat layer (tx_freertos.c).
+     * Creates its own heap pool and idle task for vTaskDelete support.
+     * Must be called here — after kernel init but before any FreeRTOS API
+     * calls (WiFi, BLE, etc. all use FreeRTOS APIs via the compat layer). */
+    status = tx_freertos_init();
+    if (status != TX_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to initialize FreeRTOS compat layer: %u", status);
+        return;
+    }
+    ESP_LOGI(TAG, "FreeRTOS compat layer initialized");
+
     /* Create the main application thread */
     status = tx_thread_create(
         &main_thread,
@@ -111,6 +147,19 @@ void tx_application_define(void *first_unused_memory)
         ESP_LOGE(TAG, "Failed to create main thread: %u", status);
         return;
     }
+
+    /* Mark scheduler as started — tx_kernel_enter() starts the ThreadX
+     * scheduler immediately after this function returns. FreeRTOS compat
+     * APIs (locks, semaphores) need this to know they can use ThreadX. */
+    txfr_scheduler_started = 1u;
+
+    /* Enable ESP-IDF interrupt dispatch stack switching.
+     * rtos_int_enter/rtos_int_exit (rtos_int_hooks.S) check these to decide
+     * whether to save/restore SP and switch to the ISR stack.
+     * pxCurrentTCBs points to our fake TCB (just a SP save slot).
+     * port_xSchedulerRunning tells the hooks the scheduler is active. */
+    pxCurrentTCBs = &s_current_task_sp_save;
+    port_xSchedulerRunning = 1u;
 
     ESP_LOGI(TAG, "ThreadX application defined — main thread created");
 }

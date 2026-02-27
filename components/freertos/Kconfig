@@ -1,0 +1,101 @@
+# Kconfig stubs for CONFIG_FREERTOS_* options checked by ESP-IDF components.
+# When ThreadX is selected, these provide default values so ESP-IDF code compiles.
+# When FreeRTOS is selected, the real Kconfig from $IDF_PATH takes over
+# (but our override component is active, so we must provide these).
+
+menu "FreeRTOS"
+
+    config FREERTOS_HZ
+        int "Tick rate (Hz)"
+        default 100
+
+    config FREERTOS_UNICORE
+        bool
+        default y
+        select ESP_SYSTEM_SINGLE_CORE_MODE
+
+    config FREERTOS_NUMBER_OF_CORES
+        int
+        default 1
+
+    config FREERTOS_THREAD_LOCAL_STORAGE_POINTERS
+        int "Thread local storage pointers"
+        default 2
+
+    config FREERTOS_IDLE_TASK_STACKSIZE
+        int "Idle task stack size"
+        default 1536
+
+    config FREERTOS_MAX_TASK_NAME_LEN
+        int "Max task name length"
+        default 16
+
+    config FREERTOS_TIMER_TASK_STACK_DEPTH
+        int "Timer task stack depth"
+        default 2048
+
+    config FREERTOS_TIMER_QUEUE_LENGTH
+        int "Timer queue length"
+        default 10
+
+    config FREERTOS_TIMER_TASK_PRIORITY
+        int "Timer task priority"
+        default 1
+
+    config FREERTOS_CHECK_STACKOVERFLOW
+        int "Stack overflow check method"
+        default 2
+
+    config FREERTOS_DEBUG_OCDAWARE
+        bool "OpenOCD debug awareness"
+        default y
+
+    config FREERTOS_ENABLE_TASK_SNAPSHOT
+        bool
+        default n
+
+    config FREERTOS_PLACE_FUNCTIONS_INTO_FLASH
+        bool
+        default n
+
+    config FREERTOS_ISR_STACKSIZE
+        int "ISR stack size"
+        default 1536
+
+    config FREERTOS_NO_AFFINITY
+        # Not used by ThreadX at runtime (ESP32-C6 is single-core).
+        # Required as a build-system dependency: ESP-IDF Kconfig files
+        # (esp_system, esp_timer, lwip) reference this symbol as a default
+        # for hex options like ESP_MAIN_TASK_AFFINITY. Without it, kconfgen
+        # tries to parse the string "FREERTOS_NO_AFFINITY" as a hex literal
+        # and crashes. Value 0x7FFFFFFF = INT_MAX = "no core affinity".
+        hex
+        default 0x7FFFFFFF
+
+    config FREERTOS_TASK_FUNCTION_WRAPPER
+        bool
+        default n
+
+    config FREERTOS_TLSP_DELETION_CALLBACKS
+        bool
+        default y
+
+    config FREERTOS_ENABLE_BACKWARD_COMPATIBILITY
+        bool
+        default y
+
+    config FREERTOS_USE_TRACE_FACILITY
+        bool "configUSE_TRACE_FACILITY"
+        default n
+
+    config FREERTOS_USE_LIST_DATA_INTEGRITY_CHECK_BYTES
+        # In ThreadX mode, txfr_sem_t (~96 bytes) exceeds the default
+        # struct __lock size (84 bytes). Enabling this bumps struct __lock
+        # to int reserved[27] = 108 bytes, satisfying the static assertion
+        # in newlib/locks.c. In FreeRTOS mode, this enables the actual
+        # FreeRTOS list data integrity check feature (default off).
+        bool "configUSE_LIST_DATA_INTEGRITY_CHECK_BYTES"
+        default y if RTOS_SELECTION_THREADX
+        default n
+
+endmenu

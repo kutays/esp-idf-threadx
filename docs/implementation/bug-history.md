@@ -1924,3 +1924,124 @@ explicitly re-declared in freertos_compat. To date, two properties are affected:
 | Compile definition `TX_INCLUDE_USER_DEFINE_FILE` | `target_compile_definitions PUBLIC` | `target_compile_definitions PUBLIC` |
 
 ---
+
+## Bug 35 — `portYIELD_FROM_ISR` Calls Thread-Level API from ISR Context
+
+**Iteration**: 30
+**Date**: 2026-02-27
+
+### Symptom
+
+System boots, WiFi STA initializes, both main thread and scanner thread print once
+(at tick 32 and 33 respectively), then the system freezes permanently. No more tick
+output, no more thread activity.
+
+### Investigation
+
+The freeze occurs ~330ms after boot — exactly when the WiFi driver fires its first
+interrupt. ThreadX scheduling works fine before that point (two threads interleave
+correctly). The freeze timing correlates with WiFi radio initialization completing.
+
+When the WiFi ISR fires on a non-17 CPU line, it goes through the ESP-IDF interrupt
+path (`_interrupt_handler` → `rtos_int_enter` → WiFi handler → `rtos_int_exit`).
+Inside the WiFi handler, ESP-IDF calls `portYIELD_FROM_ISR()` to request a context
+switch after signaling a semaphore or event group.
+
+### Root Cause
+
+`portYIELD_FROM_ISR(...)` was defined as `vPortYield()` in both `FreeRTOSConfig.h`
+and `portmacro.h`. `vPortYield()` calls `tx_thread_relinquish()`, which is a
+**thread-level** ThreadX API. Calling it from ISR context is illegal because:
+
+1. It modifies `_tx_thread_current_ptr` (the scheduler's "currently running thread"
+   pointer) while the ISR context save/restore expects it to remain stable
+2. It manipulates the ready list without ISR-safe protection
+3. It attempts a context switch while running on the ISR stack, not a thread stack
+4. The subsequent `rtos_int_exit` tries to restore SP from `pxCurrentTCBs`, which
+   may now be inconsistent due to the scheduler corruption
+
+**Call chain in the bug:**
+```
+WiFi ISR (on ISR stack, _tx_thread_system_state > 0)
+  → portYIELD_FROM_ISR(pdTRUE)
+    → vPortYield()
+      → tx_thread_relinquish()    ← ILLEGAL: thread-level API from ISR!
+        → modifies _tx_thread_current_ptr
+        → corrupts scheduler state
+        → system hangs on next context switch
+```
+
+**How real FreeRTOS does it correctly:**
+```
+WiFi ISR (on ISR stack)
+  → portYIELD_FROM_ISR(pdTRUE)
+    → vPortYieldFromISR()
+      → xPortSwitchFlag = 1       ← Just sets a flag! No scheduler call.
+  ... ISR continues normally ...
+  → rtos_int_exit
+    → checks xPortSwitchFlag
+    → if set: calls vTaskSwitchContext() to pick highest-priority task
+    → restores SP from new task's TCB
+    → mret to new task
+```
+
+The critical difference: real FreeRTOS defers the actual context switch to the ISR
+exit path. Our ThreadX implementation was calling the scheduler directly from within
+the ISR handler.
+
+### Fix
+
+Changed `portYIELD_FROM_ISR` and `portEND_SWITCHING_ISR` to no-ops in both files:
+
+**`FreeRTOSConfig.h`:**
+```c
+#define portYIELD_FROM_ISR(...)             ((void)0)
+#define portEND_SWITCHING_ISR(...)          ((void)0)
+```
+
+**`portmacro.h`:**
+```c
+#undef portYIELD_FROM_ISR
+#undef portEND_SWITCHING_ISR
+#define portYIELD_FROM_ISR(...)         ((void)0)
+#define portEND_SWITCHING_ISR(...)      ((void)0)
+```
+
+The `#undef` in `portmacro.h` is necessary because `FreeRTOSConfig.h` is included
+first (by the upstream compat `FreeRTOS.h`), so `portmacro.h` must explicitly
+undefine before redefining to avoid `-Werror=redefine` compilation failure.
+
+### Why No-Op Is Correct
+
+ThreadX handles preemption automatically. When a WiFi ISR signals a ThreadX
+semaphore (via the compat layer's `xSemaphoreGive` → `tx_semaphore_put`), ThreadX
+internally updates `_tx_thread_execute_ptr` to point to the highest-priority ready
+thread. At the next timer tick (≤10ms at 100 Hz), `_tx_thread_context_restore`
+compares `_tx_thread_execute_ptr` vs `_tx_thread_current_ptr` and performs the
+context switch if they differ.
+
+Trade-off: up to 10ms latency for ISR-to-thread wakeup. Acceptable for WiFi/BLE
+events, scan results, connection state changes.
+
+### Future Optimization
+
+The infrastructure for immediate ISR-triggered context switches already exists:
+- `rtos_int_hooks.S` has `xPortSwitchFlag` check and `vTaskSwitchContext` call
+- `vTaskSwitchContext` is currently a no-op stub in `port.c`
+
+To enable immediate switching:
+1. Change `portYIELD_FROM_ISR` to set `xPortSwitchFlag = 1`
+2. Implement `vTaskSwitchContext` to update `pxCurrentTCBs` from ThreadX's
+   `_tx_thread_execute_ptr`
+
+This requires careful integration between ThreadX's TCB and the fake TCB used by
+`rtos_int_enter`/`rtos_int_exit`.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `components/freertos/threadx/include/FreeRTOSConfig.h` | `portYIELD_FROM_ISR`/`portEND_SWITCHING_ISR` → `((void)0)` |
+| `components/freertos/threadx/include/freertos/portmacro.h` | `#undef` + redefine to `((void)0)` |
+
+---

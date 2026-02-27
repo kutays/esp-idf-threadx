@@ -107,13 +107,21 @@ void _tx_port_setup_timer_interrupt(void)
     /* Step 2: Configure SYSTIMER using the HAL (same as FreeRTOS does)   */
     /* ------------------------------------------------------------------ */
 
-    /* Enable the SYSTIMER peripheral bus clock */
-    PERIPH_RCC_ACQUIRE_ATOMIC(PERIPH_SYSTIMER_MODULE, ref_count) {
-        if (ref_count == 0) {
-            systimer_ll_enable_bus_clock(true);
-            systimer_ll_reset_register();
-        }
-    }
+    /* The SYSTIMER peripheral bus clock is already enabled by ESP-IDF's esp_timer
+     * init (ESP_SYSTEM_INIT_FN priority 101, runs during do_core_init()).
+     *
+     * We intentionally do NOT call systimer_ll_enable_bus_clock() or
+     * PERIPH_RCC_ACQUIRE_ATOMIC here because:
+     * 1. systimer_ll_enable_bus_clock() is wrapped in a macro requiring
+     *    __DECLARE_RCC_RC_ATOMIC_ENV (the PERIPH_RCC critical-section env).
+     * 2. PERIPH_RCC_ACQUIRE_ATOMIC uses portENTER/EXIT_CRITICAL, and during init
+     *    vPortExitCritical() re-enables mstatus.MIE when nesting count reaches 0.
+     *    This lets the SYSTIMER interrupt fire before any threads exist, causing
+     *    _tx_thread_context_restore to hang in its idle loop (same as Bug 29).
+     * 3. The bus clock is already on — no action needed.
+     *
+     * Do NOT reset SYSTIMER registers — esp_timer configured other alarms/counters
+     * during ESP-IDF CORE init that we must not disturb. */
 
     /* Initialise the HAL context (sets hal->dev to SYSTIMER hardware base) */
     systimer_hal_init(&s_systimer_hal);

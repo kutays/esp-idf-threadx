@@ -47,6 +47,12 @@
     .extern _tx_port_setup_timer_interrupt
     .extern _tx_esp32c6_timer_isr
 
+    /* ESP-IDF's generic interrupt dispatcher (from riscv/vectors.S).
+     * All non-ThreadX interrupts (WiFi, BLE, etc.) are routed here.
+     * It saves/restores FreeRTOS-style context via rtos_int_enter/exit,
+     * then dispatches to the handler registered via intr_handler_set(). */
+    .extern _interrupt_handler
+
     /* Interrupt stack frame size: 32 registers * REGBYTES (no FP on ESP32-C6) */
     .equ INT_FRAME_SIZE, (32 * REGBYTES)
 
@@ -72,37 +78,37 @@
     .type   _tx_esp32c6_vector_table, @function
 _tx_esp32c6_vector_table:
     j   _tx_esp32c6_exception_entry /* 0: exception entry */
-    j   _tx_esp32c6_unused_int      /* 1: unused CPU interrupt */
-    j   _tx_esp32c6_unused_int      /* 2: unused CPU interrupt */
-    j   _tx_esp32c6_unused_int      /* 3: unused CPU interrupt */
-    j   _tx_esp32c6_unused_int      /* 4: unused CPU interrupt */
-    j   _tx_esp32c6_unused_int      /* 5: unused CPU interrupt */
-    j   _tx_esp32c6_unused_int      /* 6: reserved (permanently disabled) */
-    j   _tx_esp32c6_unused_int      /* 7: reserved (CLINT machine timer) */
-    j   _tx_esp32c6_unused_int      /* 8: unused */
-    j   _tx_esp32c6_unused_int      /* 9: unused */
-    j   _tx_esp32c6_unused_int      /* 10: unused */
-    j   _tx_esp32c6_unused_int      /* 11: unused (effectively disabled) */
-    j   _tx_esp32c6_unused_int      /* 12: unused */
-    j   _tx_esp32c6_unused_int      /* 13: unused */
-    j   _tx_esp32c6_unused_int      /* 14: unused */
-    j   _tx_esp32c6_unused_int      /* 15: unused (effectively disabled) */
-    j   _tx_esp32c6_unused_int      /* 16: unused (effectively disabled) */
-    j   _tx_esp32c6_trap_handler    /* 17: SYSTIMER tick (CPU interrupt line 17) */
-    j   _tx_esp32c6_unused_int      /* 18: unused */
-    j   _tx_esp32c6_unused_int      /* 19: unused */
-    j   _tx_esp32c6_unused_int      /* 20: unused */
-    j   _tx_esp32c6_unused_int      /* 21: unused */
-    j   _tx_esp32c6_unused_int      /* 22: unused */
-    j   _tx_esp32c6_unused_int      /* 23: unused */
-    j   _tx_esp32c6_unused_int      /* 24: unused (ETS_INT_WDT_INUM in FreeRTOS) */
-    j   _tx_esp32c6_unused_int      /* 25: unused */
-    j   _tx_esp32c6_unused_int      /* 26: unused */
-    j   _tx_esp32c6_unused_int      /* 27: unused */
-    j   _tx_esp32c6_unused_int      /* 28: unused */
-    j   _tx_esp32c6_unused_int      /* 29: unused */
-    j   _tx_esp32c6_unused_int      /* 30: unused */
-    j   _tx_esp32c6_unused_int      /* 31: unused */
+    j   _interrupt_handler          /* 1: ESP-IDF generic dispatch (WiFi, etc.) */
+    j   _interrupt_handler          /* 2: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 3: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 4: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 5: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 6: reserved (permanently disabled) */
+    j   _interrupt_handler          /* 7: reserved (CLINT machine timer) */
+    j   _interrupt_handler          /* 8: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 9: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 10: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 11: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 12: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 13: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 14: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 15: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 16: ESP-IDF generic dispatch */
+    j   _tx_esp32c6_trap_handler    /* 17: SYSTIMER tick (ThreadX context save/restore) */
+    j   _interrupt_handler          /* 18: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 19: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 20: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 21: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 22: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 23: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 24: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 25: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 26: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 27: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 28: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 29: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 30: ESP-IDF generic dispatch */
+    j   _interrupt_handler          /* 31: ESP-IDF generic dispatch */
 
     .option pop
 
@@ -128,7 +134,9 @@ _tx_esp32c6_exception_entry:
     j       _tx_esp32c6_exception_entry  /* should never reach here */
     .size _tx_esp32c6_exception_entry, . - _tx_esp32c6_exception_entry
 
-/* Catch-all for any interrupt line we didn't register */
+/* _tx_esp32c6_unused_int is no longer needed — all non-17 vectors route
+ * to _interrupt_handler (ESP-IDF generic dispatch). Kept as a safety net
+ * in case something references it. */
     .type _tx_esp32c6_unused_int, @function
 _tx_esp32c6_unused_int:
     j   _tx_esp32c6_unused_int  /* spin — should never arrive here */

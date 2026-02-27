@@ -20,3 +20,6 @@ CONFIG_FREERTOS_HZ=100
 
 # RTOS selection — ThreadX by default for this project
 CONFIG_RTOS_SELECTION_THREADX=y
+
+# ThreadX compat layer needs larger struct __lock (txfr_sem_t > 84 bytes)
+CONFIG_FREERTOS_USE_LIST_DATA_INTEGRITY_CHECK_BYTES=y
