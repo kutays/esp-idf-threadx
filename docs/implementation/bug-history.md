@@ -2045,3 +2045,763 @@ This requires careful integration between ThreadX's TCB and the fake TCB used by
 | `components/freertos/threadx/include/freertos/portmacro.h` | `#undef` + redefine to `((void)0)` |
 
 ---
+
+## Bug 36 — `_tx_thread_system_state` Not Managed During ESP-IDF ISRs
+
+**Iteration**: 31
+**Date**: 2026-02-27
+
+### Symptom
+
+After fixing Bug 35, system still freezes after tick 32-33 when first WiFi interrupt
+fires. Both threads print once then stop — timer tick appears to stop entirely.
+
+### Investigation
+
+Verified via agent search that ESP-IDF's `rv_utils_intr_enable/disable` do NOT clear
+`mie` bit 17 — they only manipulate `PLIC_MXINT_ENABLE_REG`. Our timer hardware
+configuration is preserved.
+
+The actual issue was `_tx_thread_system_state` — ThreadX's ISR context indicator.
+
+### Root Cause
+
+`rtos_int_hooks.S` managed `port_uxInterruptNesting` (FreeRTOS compat counter) but
+never touched `_tx_thread_system_state` (ThreadX's own ISR counter).
+
+When a WiFi ISR called `xSemaphoreGive` → compat layer → `tx_semaphore_put` →
+`_tx_thread_system_resume`, ThreadX checked `_tx_thread_system_state`:
+
+- Value was `0` → ThreadX thought it was in thread context
+- Called `_tx_thread_system_return()` for immediate preemption
+- This saved the ISR stack pointer as the thread's stack pointer
+- Scheduler corruption → system hang
+
+The ThreadX timer path (vector[17]) correctly manages `_tx_thread_system_state` via
+`_tx_thread_context_save` (increment) and `_tx_thread_context_restore` (decrement).
+The ESP-IDF path (vector[N≠17]) is completely independent and needed its own
+increment/decrement.
+
+### Fix
+
+Added to `rtos_int_hooks.S`:
+
+**In `rtos_int_enter`** — increment `_tx_thread_system_state` alongside
+`port_uxInterruptNesting`:
+```asm
+    .extern _tx_thread_system_state
+
+    la      t3, _tx_thread_system_state
+    lw      t5, 0(t3)
+    addi    t5, t5, 1
+    sw      t5, 0(t3)
+```
+
+**In `rtos_int_exit`** — decrement `_tx_thread_system_state` alongside
+`port_uxInterruptNesting`:
+```asm
+    la      t2, _tx_thread_system_state
+    lw      t4, 0(t2)
+    beqz    t4, .Lskip_sys_dec
+    addi    t4, t4, -1
+    sw      t4, 0(t2)
+.Lskip_sys_dec:
+```
+
+Nesting is correct for both same-path and cross-path scenarios:
+- ESP-IDF only: 0→1 (enter), 1→0 (exit)
+- ThreadX nests into ESP-IDF: 0→1 (rtos_enter), 1→2 (ctx_save), 2→1 (ctx_restore), 1→0 (rtos_exit)
+
+### Result
+
+WiFi scanning confirmed working. 17 networks detected. Both ThreadX threads
+running continuously alongside WiFi ISR processing.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `components/freertos/threadx/src/rtos_int_hooks.S` | Added `_tx_thread_system_state` increment/decrement in `rtos_int_enter`/`rtos_int_exit` |
+
+---
+
+## Known Issue — Blocking WiFi Scan Timeout
+
+**Iteration**: 31
+**Date**: 2026-02-27
+**Status**: Open (workaround in place)
+
+### Symptom
+
+`esp_wifi_scan_start(&config, true)` (blocking mode) times out after ~12 seconds
+with `ESP_ERR_WIFI_TIMEOUT`. The scan hardware works — non-blocking mode returns
+correct results.
+
+### Workaround
+
+Use non-blocking scan with a sleep:
+```c
+esp_wifi_scan_start(&scan_config, false);   // non-blocking
+tx_thread_sleep(500);                        // 5 seconds
+esp_wifi_scan_get_ap_num(&ap_count);         // collect results
+esp_wifi_scan_get_ap_records(&count, recs);
+```
+
+### Likely Root Cause
+
+The blocking path internally waits on a semaphore posted when `WIFI_EVENT_SCAN_DONE`
+is processed through the event loop chain:
+
+```
+WiFi HW scan done → WiFi ISR → WiFi task → esp_event_post(SCAN_DONE)
+  → event loop task → internal handler → xSemaphoreGive(scan_done_sem)
+  → esp_wifi_scan_start unblocks
+```
+
+The semaphore never gets posted, so the notification is lost somewhere in this chain.
+Likely candidates for investigation:
+- `xQueueSend`/`xQueueReceive` in event loop task (queue compat correctness)
+- Internal WiFi default event handler dispatch (registration at `esp_wifi_init` time)
+- Semaphore give/take across task boundaries
+
+---
+
+## Bug 37 — ESP-IDF ISR Exit Never Triggers ThreadX Context Switch (esp_timer Broken)
+
+**Iteration**: 32
+**Date**: 2026-02-27
+
+### Symptom
+
+WiFi scan reports only channel 1 networks. `esp_timer` periodic callbacks never fire.
+Diagnostic timer (`diag_timer_cb`, 2-second period) never prints after initial log.
+
+WiFi scanning relies on `esp_timer` for per-channel dwell timing:
+```
+esp_wifi_scan_start → hardware tunes to channel 1 → esp_timer fires after dwell time
+  → WiFi driver moves to channel 2 → esp_timer fires → channel 3 → ... → channel 13
+  → WIFI_EVENT_SCAN_DONE
+```
+
+Without esp_timer callbacks, the scan stays on channel 1 forever.
+
+### How to Investigate This (Reasoning Chain)
+
+This section explains the step-by-step reasoning process for debugging this class of
+issue — "a task's callback never runs even though its interrupt fires." If you encounter
+a similar problem, follow these steps.
+
+#### Step 1: Confirm the Hardware Interrupt Fires
+
+Check if the peripheral interrupt reaches the CPU:
+
+```
+[diag] INTMTX src59 (esp_timer) → CPU line 5
+[diag] PLIC ENABLE = 0x000603e2 (line 5 bit = 1)
+[diag] mie = 0x00000888 (line 5 bit = ?)
+[diag] SYSTIMER INT_ENA = 0x00000007 (bit2=alarm2=1)
+```
+
+What to check at each layer (see `docs/implementation/hardware-interrupts.md`):
+
+| Layer | Register | What to verify |
+|-------|----------|----------------|
+| Peripheral | SYSTIMER INT_ENA (0x6000A064) | Bit for alarm2 (bit 2) = 1 |
+| INTMTX | 0x60010000 + source*4 | Source 59 mapped to a CPU line |
+| PLIC | ENABLE (0x20001000) | Bit for that CPU line = 1 |
+| PLIC | Priority (0x20001010 + line*4) | Priority > threshold |
+| CPU | mie CSR | Bit 11 (MEIE) = 1 |
+| CPU | mstatus CSR | Bit 3 (MIE) = 1 when thread runs |
+
+If all layers are configured, the interrupt IS reaching the CPU. The problem is
+downstream — in the ISR dispatch or context switch path.
+
+#### Step 2: Trace the ISR Dispatch Path
+
+ESP32-C6 uses vectored interrupts. CPU line N jumps to `mtvec_base + N*4`.
+
+Our vector table (`tx_initialize_low_level.S`) has two kinds of entries:
+```
+vector[0]  = j _tx_esp32c6_exception_handler    ← exceptions (ecall, fault)
+vector[17] = j _tx_esp32c6_trap_handler          ← ThreadX timer (SYSTIMER alarm 0)
+vector[N]  = j _interrupt_handler                ← ALL OTHER interrupts (ESP-IDF path)
+```
+
+**esp_timer uses SYSTIMER alarm 2 → source 59 → CPU line 5 → vector[5] → `_interrupt_handler`**
+
+This means esp_timer goes through the ESP-IDF interrupt path, NOT the ThreadX timer path.
+
+#### Step 3: Understand the ESP-IDF Interrupt Path
+
+`_interrupt_handler` is defined in `esp-idf/components/riscv/vectors.S`. Its flow:
+
+```
+_interrupt_handler:
+    save_general_regs            ← saves ALL 31 registers to stack (RV_STK_* offsets)
+    mv   s1, mcause             ← save mcause in callee-saved register
+    mv   s2, mstatus            ← save mstatus in callee-saved register
+    call rtos_int_enter          ← OUR HOOK: manage nesting, switch to ISR stack
+    mv   s4, a0                 ← save "context" return value (0 on C6)
+
+    li   t0, <PLIC_MX_THRESH>
+    lw   s3, (t0)              ← save old PLIC threshold
+    sw   <high>, (t0)          ← raise threshold (mask lower-priority interrupts)
+
+    csrsi mstatus, 0x8         ← ENABLE MIE — allows higher-priority interrupts to nest
+
+    mv   a0, sp                ← arg0 = stack pointer (context frame)
+    mv   a1, s1                ← arg1 = mcause (interrupt number)
+    call _global_interrupt_handler  ← dispatch to registered handler (esp_timer ISR)
+
+    csrci mstatus, 0x8         ← DISABLE MIE — prevent interrupts during exit
+    sw   s3, (t0)              ← restore PLIC threshold
+
+    mv   a0, s2                ← arg0 = saved mstatus (for rtos_int_exit)
+    mv   a1, s4                ← arg1 = context (unused)
+    call rtos_int_exit           ← OUR HOOK: manage nesting, check for context switch
+
+    csrw mstatus, a0           ← restore mstatus (a0 = return from rtos_int_exit)
+    restore_general_regs        ← restore all 31 registers
+    mret                        ← return from interrupt
+```
+
+Key observations:
+- `s1`, `s2`, `s3`, `s4` are callee-saved registers — they survive function calls
+- After `_global_interrupt_handler` dispatches the ISR (e.g., esp_timer's handler), the
+  ISR handler may call `xSemaphoreGive` → compat layer → `tx_semaphore_put` to wake up
+  the esp_timer task
+- `rtos_int_exit` is called AFTER the ISR handler returns — this is where we decide
+  whether to context-switch to the newly-woken thread
+
+#### Step 4: Understand What `tx_semaphore_put` Does During an ISR
+
+When esp_timer's ISR handler calls `xSemaphoreGive(notification_sem)`:
+
+```
+xSemaphoreGive → xQueueGenericSend → tx_semaphore_put(&sem)
+```
+
+Inside `tx_semaphore_put` (file: `common/src/tx_semaphore_put.c`):
+```c
+// If a thread is waiting on this semaphore:
+_tx_thread_preempt_disable++;          // Prevent preemption during resume
+_tx_thread_system_resume(thread_ptr);  // Make the thread ready
+_tx_thread_preempt_disable--;          // Allow preemption again
+```
+
+Inside `_tx_thread_system_resume` (file: `common/src/tx_thread_system_resume.c`):
+```c
+// Line ~302 — THIS IS THE KEY LINE:
+_tx_thread_execute_ptr = thread_ptr;   // ALWAYS updated if higher priority
+// ... but actual preemption check is:
+if ((_tx_thread_system_state == 0) && (_tx_thread_preempt_disable == 0)) {
+    _tx_thread_system_return();        // Only preempts in thread context
+}
+```
+
+During an ISR:
+- `_tx_thread_system_state > 0` (we incremented it in rtos_int_enter — Bug 36)
+- So `_tx_thread_system_return()` is NOT called here
+- BUT `_tx_thread_execute_ptr` IS updated to point to the higher-priority thread
+- The execute_ptr update is "latched" — it persists after the ISR returns
+
+**This means: after the ISR, `_tx_thread_execute_ptr ≠ _tx_thread_current_ptr`.**
+Someone needs to check this and trigger a context switch.
+
+#### Step 5: Identify What Was Missing (The Bug)
+
+The OLD `rtos_int_exit` code did this when exiting the last ISR nesting level:
+
+```asm
+    /* OLD CODE — BROKEN */
+    lw      t0, xPortSwitchFlag         ← check FreeRTOS switch flag
+    beqz    t0, .Lno_switch             ← if 0, skip context switch
+    sw      zero, xPortSwitchFlag       ← clear flag
+    call    vTaskSwitchContext           ← call context switch
+    lw      t0, pxCurrentTCBs           ← load current TCB
+    lw      sp, 0(t0)                   ← restore SP from TCB
+.Lno_switch:
+    ...
+```
+
+THREE problems:
+1. **`xPortSwitchFlag` was never set.** `portYIELD_FROM_ISR(x)` was defined as
+   `((void)0)` — a no-op. In FreeRTOS, `portYIELD_FROM_ISR` sets this flag, but
+   in our ThreadX compat layer, we correctly made it a no-op because calling
+   `vPortYield()` from ISR context corrupts ThreadX (Bug 35). Nobody else sets it.
+
+2. **`vTaskSwitchContext` was an empty stub.** Even if the flag were set, the function
+   did nothing. It existed only as a linker symbol.
+
+3. **`pxCurrentTCBs` was always NULL.** We never update this variable for ThreadX
+   threads (it's used by ESP-IDF's `vectors.S` for stack switching in `rtos_int_enter`,
+   but our current implementation doesn't maintain it for context switch purposes).
+
+**Result**: `rtos_int_exit` NEVER performed a context switch. When `tx_semaphore_put`
+woke up the esp_timer task during the WiFi ISR, `_tx_thread_execute_ptr` was updated
+to point to the esp_timer task, but nobody checked it. The original thread continued
+running after `mret`, and the esp_timer task only ran when the ThreadX timer tick
+(vector[17]) happened to check `execute_ptr` in `_tx_thread_context_restore` — which
+was at most every 10ms (100 Hz tick rate). For time-critical operations like WiFi
+channel dwell timing, this delay was catastrophic.
+
+#### Step 6: Understand How FreeRTOS Solves This (For Reference)
+
+In real FreeRTOS on ESP32-C6:
+```
+ISR handler → xSemaphoreGiveFromISR(&sem, &xHigherPriorityTaskWoken)
+  → if xHigherPriorityTaskWoken: portYIELD_FROM_ISR(xHigherPriorityTaskWoken)
+  → sets xPortSwitchFlag = 1
+
+rtos_int_exit:
+  → sees xPortSwitchFlag == 1
+  → calls vTaskSwitchContext() → updates pxCurrentTCB
+  → restores SP from new pxCurrentTCB → mret into higher-priority task
+```
+
+We can't use this approach because ThreadX and FreeRTOS have fundamentally different
+context management. FreeRTOS saves/restores ALL registers in a single flat frame.
+ThreadX uses two different frame formats (solicited = callee-saved only, interrupt =
+all registers). Trying to mix them would corrupt the stack.
+
+### Root Cause
+
+`rtos_int_exit` had no working mechanism to trigger a ThreadX context switch when
+exiting ESP-IDF interrupt handlers. The `xPortSwitchFlag + vTaskSwitchContext`
+mechanism was a FreeRTOS concept that doesn't apply to ThreadX.
+
+### Fix
+
+Replace the entire preemption mechanism in `rtos_int_exit` with a call to ThreadX's
+own `_tx_thread_system_preempt_check()`.
+
+**New `rtos_int_exit` (annotated assembly)**:
+
+```asm
+rtos_int_exit:
+    /* ── Save mstatus in callee-saved register ──────────────────────
+     * a0 = saved mstatus from _interrupt_handler (passed via s2).
+     * s11 is callee-saved — it survives ALL function calls, including
+     * _tx_thread_system_return() and the entire scheduler round-trip.
+     * When the original thread is eventually re-scheduled via
+     * _tx_thread_synch_return, s11 is restored, so we get our mstatus back. */
+    mv      s11, a0
+
+    /* ── Check if scheduler is running ────────────────────────────── */
+    lw      t0, port_xSchedulerRunning
+    beqz    t0, .Lexit_end              /* Pre-scheduler: return mstatus */
+
+    /* ── Decrement ISR nesting counter (FreeRTOS compat) ──────────── */
+    la      t2, port_uxInterruptNesting
+    lw      t3, 0(t2)
+    beqz    t3, .Lskip_dec              /* Defensive: already 0 */
+    addi    t3, t3, -1
+    sw      t3, 0(t2)
+.Lskip_dec:
+
+    /* ── Decrement ThreadX system state (Bug 36 fix) ──────────────── */
+    la      t2, _tx_thread_system_state
+    lw      t4, 0(t2)
+    beqz    t4, .Lskip_sys_dec          /* Defensive: already 0 */
+    addi    t4, t4, -1
+    sw      t4, 0(t2)
+.Lskip_sys_dec:
+
+    /* ── If still nested, skip preemption check ───────────────────── */
+    bnez    t3, .Lexit_end              /* t3 = port_uxInterruptNesting after dec */
+
+    /* ══════════════════════════════════════════════════════════════════
+     * EXITING LAST ISR LEVEL — THIS IS WHERE THE BUG 37 FIX LIVES
+     *
+     * _tx_thread_system_preempt_check() does three things:
+     *   1. Checks _tx_thread_system_state == 0   (we just decremented to 0)
+     *   2. Checks _tx_thread_preempt_disable == 0 (balanced by tx_semaphore_put)
+     *   3. Compares _tx_thread_execute_ptr != _tx_thread_current_ptr
+     *
+     * If all conditions are met, it calls _tx_thread_system_return() which:
+     *   a) Allocates 16*REGBYTES on the CURRENT stack
+     *   b) Stores type=0 (solicited frame marker)
+     *   c) Saves ra, s0-s11, mstatus (callee-saved regs)
+     *   d) Saves SP into current thread's TCB
+     *   e) Switches to system stack
+     *   f) Clears _tx_thread_current_ptr
+     *   g) Jumps to _tx_thread_schedule
+     *
+     * The scheduler then:
+     *   - Waits for _tx_thread_execute_ptr != NULL (already set)
+     *   - Sets _tx_thread_current_ptr = execute_ptr
+     *   - Loads new thread's SP from its TCB
+     *   - Checks stack type at offset 0
+     *     - Type 1 (interrupt frame): full register restore + mret
+     *     - Type 0 (solicited frame): restore callee-saved regs + ret
+     *   - The higher-priority thread runs
+     *
+     * When the higher-priority thread finishes (or sleeps/blocks):
+     *   - Scheduler picks our original thread again
+     *   - Loads our SP (which points to the solicited frame we saved above)
+     *   - _tx_thread_synch_return restores ra, s0-s11, mstatus
+     *   - Including s11 = our saved mstatus!
+     *   - `ret` returns to the `lw ra, 0(sp)` instruction below
+     *   - We continue exiting as if the preemption never happened
+     * ══════════════════════════════════════════════════════════════════ */
+    addi    sp, sp, -16
+    sw      ra, 0(sp)
+    call    _tx_thread_system_preempt_check
+    lw      ra, 0(sp)
+    addi    sp, sp, 16
+
+.Lexit_end:
+    mv      a0, s11                     /* Return mstatus to _interrupt_handler */
+    ret
+```
+
+**Why `_tx_thread_system_preempt_check` is the right solution**:
+
+1. **It's ThreadX's own mechanism.** No need to bridge between FreeRTOS and ThreadX
+   concepts. ThreadX already tracks which thread should run next (`_tx_thread_execute_ptr`)
+   and knows how to save/restore context.
+
+2. **It handles the solicited/interrupt frame distinction correctly.**
+   `_tx_thread_system_return()` saves a type-0 (solicited) frame with only callee-saved
+   registers. This is correct because we're in a function call context (C calling
+   convention applies), not in an interrupt context. The interrupt context is managed
+   by `_interrupt_handler` in `vectors.S` (the ESP-IDF code above/below us).
+
+3. **Callee-saved registers bridge the gap.** The register `s11` holds our saved
+   `mstatus` value. When `_tx_thread_system_return()` saves the solicited frame, it
+   stores s11 at offset `1*REGBYTES(sp)`. When the thread resumes via
+   `_tx_thread_synch_return`, s11 is restored from that offset. So our mstatus value
+   survives the entire scheduler round-trip.
+
+4. **The return path is transparent.** After `_tx_thread_synch_return` does `ret`,
+   control returns to the instruction after `call _tx_thread_system_preempt_check`.
+   We pop `ra`, return mstatus in `a0`, and `rtos_int_exit` returns to
+   `_interrupt_handler`. From `_interrupt_handler`'s perspective, `rtos_int_exit`
+   just returned normally — it has no idea that the scheduler ran in between.
+
+### Stack Frame Anatomy During Preemption
+
+When preemption happens, there are THREE nested stack frames on the original thread's
+stack:
+
+```
+Higher addresses (stack top)
+┌──────────────────────────────────────────────┐
+│ _interrupt_handler's saved registers          │ ← 32 registers (RV_STK_* offsets)
+│ (saved by save_general_regs macro in vectors.S)│    This is the interrupt frame
+│ Includes: ra, t0-t6, a0-a7, s0-s11, mepc    │    that will be restored by
+│                                              │    restore_general_regs + mret
+├──────────────────────────────────────────────┤
+│ rtos_int_exit's ra save                       │ ← 16 bytes (for alignment)
+│ sw ra, 0(sp)                                 │    Pop'd after preempt_check returns
+├──────────────────────────────────────────────┤
+│ _tx_thread_system_return's solicited frame    │ ← 16*REGBYTES (64 bytes on RV32)
+│ Offset 0:           type = 0 (solicited)     │    Stored by system_return
+│ Offset 1*REGBYTES:  s11 (= saved mstatus)   │    Restored by synch_return
+│ Offset 2*REGBYTES:  s10                      │
+│ ...                                          │
+│ Offset 12*REGBYTES: s0                       │
+│ Offset 13*REGBYTES: ra                       │
+│ Offset 14*REGBYTES: mstatus                  │
+├──────────────────────────────────────────────┤
+│ (system stack — scheduler runs here)          │
+└──────────────────────────────────────────────┘
+Lower addresses (stack grows down)
+```
+
+`_tx_thread_system_return` saves SP (pointing to the solicited frame) into the thread's
+TCB at `tx_thread_stack_ptr` (offset 2*REGBYTES). When the thread is re-scheduled,
+`_tx_thread_schedule` loads this SP, sees type=0 at offset 0, and jumps to
+`_tx_thread_synch_return` which restores s0-s11, ra, mstatus and does `ret`.
+
+### Complete Flow: WiFi ISR → esp_timer Task Runs → Original Thread Resumes
+
+```
+1. WiFi hardware fires interrupt → INTMTX routes to CPU line 5
+2. CPU vectors to _interrupt_handler (vector[5])
+3. _interrupt_handler:
+   a. save_general_regs (all 31 regs onto task stack)
+   b. call rtos_int_enter → system_state++ (now 1), switch to ISR stack
+   c. csrsi mstatus, 0x8 (enable nested interrupts)
+   d. call _global_interrupt_handler → dispatches WiFi ISR handler
+      WiFi ISR handler:
+        → xSemaphoreGive(notification) → tx_semaphore_put
+          → _tx_thread_system_resume(esp_timer_task)
+            → _tx_thread_execute_ptr = esp_timer_task  [LATCHED]
+            → system_state > 0, so NO immediate preempt
+   e. csrci mstatus, 0x8 (disable interrupts for exit)
+   f. call rtos_int_exit:
+      → system_state-- (now 0), nesting-- (now 0)
+      → last ISR level → call _tx_thread_system_preempt_check
+        → system_state==0 ✓, preempt_disable==0 ✓
+        → execute_ptr (esp_timer) != current_ptr (main_thread) ✓
+        → call _tx_thread_system_return:
+          → save solicited frame (type=0, s0-s11, ra, mstatus)
+          → TCB->stack_ptr = sp
+          → switch to system stack, clear current_ptr
+          → jump to _tx_thread_schedule
+            → pick esp_timer_task from execute_ptr
+            → set current_ptr = esp_timer_task
+            → load esp_timer_task's SP
+            → restore esp_timer_task's context → esp_timer_task RUNS
+              esp_timer task:
+                → calls diag_timer_cb("esp_timer fired!")
+                → calls WiFi channel-advance callback
+                → blocks on next notification (tx_semaphore_get)
+            → scheduler picks original thread again
+            → load original thread's SP (points to solicited frame)
+            → _tx_thread_synch_return:
+              → restore s0-s11 (including s11 = saved mstatus)
+              → restore ra, mstatus
+              → ret → back to instruction after call _tx_thread_system_preempt_check
+      → lw ra, 0(sp); addi sp, sp, 16
+      → mv a0, s11 (mstatus)
+      → ret → back to _interrupt_handler
+   g. csrw mstatus, a0 (restore mstatus with MIE=0)
+   h. restore_general_regs (all 31 regs from task stack)
+   i. mret → resumes original thread where it was interrupted
+```
+
+### Result
+
+- `esp_timer` callbacks now fire immediately when their ISR runs (not delayed until
+  the next 10ms ThreadX timer tick)
+- WiFi scanning works across all 13 channels
+- Both wifi_demo and basic ThreadX demo build and link correctly
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `components/freertos/threadx/src/rtos_int_hooks.S` | Replaced `xPortSwitchFlag + vTaskSwitchContext` with `_tx_thread_system_preempt_check()` call in `rtos_int_exit` |
+| `components/freertos/threadx/include/freertos/portmacro.h` | Updated `portYIELD_FROM_ISR` comment to explain new mechanism |
+| `components/freertos/threadx/src/port.c` | Updated `vTaskSwitchContext` comment (now linker stub only) |
+
+### Key Source Files for Further Study
+
+| File | What it does |
+|------|-------------|
+| `esp-idf/components/riscv/vectors.S` | `_interrupt_handler`: ESP-IDF's ISR entry/exit wrapper |
+| `esp-idf/components/riscv/interrupt.c` | `_global_interrupt_handler`: ISR dispatch table lookup |
+| `threadx/common/src/tx_thread_system_preempt_check.c` | Checks if context switch needed |
+| `threadx/common/src/tx_thread_system_resume.c` | Makes thread ready, updates `execute_ptr` |
+| `threadx/ports/risc-v64/gnu/src/tx_thread_system_return.S` | Saves solicited frame, enters scheduler |
+| `threadx/ports/risc-v64/gnu/src/tx_thread_schedule.S` | Scheduler loop + `_tx_thread_synch_return` |
+| `threadx/common/src/tx_semaphore_put.c` | Wakes waiting thread with preempt_disable guard |
+
+---
+
+## Bug 38 — `_tx_thread_system_preempt_check()` in rtos_int_exit Creates Solicited Frame on ISR Stack
+
+**Phase**: After Bug 37 fix (rtos_int_exit called `_tx_thread_system_preempt_check`)
+
+**Symptom**: System hung at `esp_wifi_start()`. The `_tx_thread_system_preempt_check()`
+approach from Bug 37 created a "solicited" context frame (type=0) on the ISR stack.
+ESP-IDF's `_interrupt_handler` expects an "interrupt" frame (type=1) with a completely
+different layout and size. When the interrupt handler tried to restore registers from
+the corrupted frame, execution went to a garbage address.
+
+**Root cause**: `_tx_thread_system_preempt_check()` calls `_tx_thread_system_return()`
+when a preemption is needed. `_tx_thread_system_return` saves callee-saved registers
+(s0-s11, ra, mstatus) in a 16*REGBYTES solicited frame on the **current stack** (which
+is the ISR stack during an ESP-IDF interrupt). It then enters `_tx_thread_schedule` which
+dispatches the higher-priority thread. When that thread eventually suspends and the
+preempted thread resumes, ThreadX restores the solicited frame.
+
+But the ESP-IDF `_interrupt_handler` doesn't know about this frame. After `rtos_int_exit`
+returns, `_interrupt_handler` does `csrw mstatus, a0` then `restore_general_regs` + `mret`.
+The stack pointer is wrong (offset by the solicited frame size), so all register restores
+read garbage values.
+
+**Fix**: Reverted `rtos_int_exit` to the FreeRTOS pattern:
+
+```asm
+rtos_int_exit:
+    mv      s11, a0                     /* Save mstatus */
+    lw      t0, port_xSchedulerRunning
+    beqz    t0, .Lexit_end
+
+    /* Decrement nesting counters (FreeRTOS + ThreadX system_state) */
+    la      t2, port_uxInterruptNesting
+    lw      t3, 0(t2)
+    addi    t3, t3, -1
+    sw      t3, 0(t2)
+
+    la      t2, _tx_thread_system_state  /* Bug 36 fix preserved */
+    lw      t4, 0(t2)
+    addi    t4, t4, -1
+    sw      t4, 0(t2)
+
+    bnez    t3, .Lexit_end              /* Still nested — keep ISR stack */
+
+    /* Check xPortSwitchFlag → vTaskSwitchContext (dead code for now) */
+    la      t0, xPortSwitchFlag
+    lw      t2, 0(t0)
+    beqz    t2, .Lno_switch
+    call    vTaskSwitchContext           /* stub */
+    sw      zero, 0(t0)
+
+.Lno_switch:
+    /* ALWAYS restore SP from pxCurrentTCBs at last ISR level */
+    lw      t0, pxCurrentTCBs
+    lw      sp, 0(t0)                   /* Restore task SP */
+
+.Lexit_end:
+    mv      a0, s11                     /* Return mstatus */
+    ret
+```
+
+**Key lesson**: rtos_int_exit MUST NOT call ThreadX functions that create stack frames
+(`_tx_thread_system_preempt_check`, `_tx_thread_system_return`). The ESP-IDF interrupt
+handler's frame format is incompatible with ThreadX's solicited frame. The ISR exit
+must be purely mechanical: decrement counters, restore SP, return mstatus.
+
+**Note on preemption**: With this pattern, ISR-level preemption (where an ISR wakes a
+higher-priority thread and it runs immediately) is NOT implemented. Preemption only
+happens at the next ThreadX timer tick (vector[17]) when `_tx_thread_context_restore`
+compares `_tx_thread_current_ptr` vs `_tx_thread_execute_ptr`. This is sufficient for
+WiFi/BLE because their critical path latency requirements are in the millisecond range.
+
+---
+
+## Bug 39 — PLIC Threshold = 1 Masks ALL ESP-IDF Interrupts (esp_timer, WiFi, BLE)
+
+**Phase**: WiFi scanning stuck on channel 1, esp_timer callbacks never fire
+
+**Symptom**: WiFi scan started but SCAN_DONE event never delivered. esp_timer diagnostic
+timer never fired. Only the ThreadX SYSTIMER tick (100 Hz) was working. Scan #1 returned
+21 results (all channel 1) but the scan never progressed to channels 2-13.
+
+**Root cause**: ESP-IDF startup sets PLIC threshold to 1 (`RVHAL_INTR_ENABLE_THRESH`).
+`esp_intr_alloc()` assigns priority 1 by default. The PLIC only delivers interrupts with
+priority **strictly greater than** the threshold. With threshold=1, priority 1 interrupts
+are masked (1 > 1 = false). This means ALL ESP-IDF interrupts (esp_timer, WiFi, BLE,
+UART, etc.) are permanently silenced.
+
+Real FreeRTOS handles this by using `esprv_intc_int_set_threshold(0)` as its
+`portENABLE_INTERRUPTS()` (lowering threshold to 0 when interrupts should be enabled).
+Our port uses `csrs mstatus, 8` (toggle MIE bit) for portENABLE/DISABLE and never
+touches the PLIC threshold.
+
+Our SYSTIMER uses priority 2 (> threshold 1), so the tick always worked. But everything
+from `esp_intr_alloc` was dead.
+
+**Evidence**: `PLIC THRESH = 0x00000001` in diagnostics, confirmed with readback.
+
+**Initial fix**: Added `PLIC_MX_THRESH = 0` in `_tx_port_setup_timer_interrupt`.
+
+**Revised fix (Bug 40)**: Moved PLIC threshold setting out of shared timer code into
+the custom FreeRTOS component via weak/strong `_tx_port_esp_idf_isr_init()`. See Bug 40.
+
+---
+
+## Bug 40 — threadx_demo Hangs After WiFi Port Restructuring
+
+**Phase**: After adding weak symbols to tx_port_startup.c and PLIC threshold fix (Bug 39)
+
+**Symptom**: threadx_demo output ends at "FreeRTOS compat layer initialized". No thread
+output, no tick count, complete hang. Diagnostic shows:
+- `mstatus = 0x00000001` (MIE=0, correct during init)
+- `PLIC THRESH = 0x00000000` (Bug 39 fix applied)
+- `mip = 0x00020000` (bit 17 pending — SYSTIMER ready)
+- `mie = 0x0a020924` (MEIE + line 17 + ESP-IDF lines)
+
+**Root cause**: Two changes in `tx_port_startup.c` that are ONLY appropriate for the
+wifi_demo were applied unconditionally to both demos:
+
+```c
+pxCurrentTCBs = &s_current_task_sp_save;   // fake TCB for ISR stack switching
+port_xSchedulerRunning = 1u;               // enables ISR stack switching
+```
+
+In the **threadx_demo** (which links the REAL ESP-IDF FreeRTOS component, NOT our custom
+override in `components/freertos/`), these symbols resolve to the real FreeRTOS variables:
+
+| Symbol | threadx_demo resolves to | wifi_demo resolves to |
+|--------|-------------------------|----------------------|
+| `port_xSchedulerRunning` | Real FreeRTOS BSS (portasm.S) | Our rtos_int_hooks.S `.data` |
+| `pxCurrentTCBs` | Real FreeRTOS BSS (portasm.S) | Our rtos_int_hooks.S `.data` |
+
+Setting `port_xSchedulerRunning = 1` in the threadx_demo tells the REAL FreeRTOS
+`rtos_int_enter`/`rtos_int_exit` (from ESP-IDF's portasm.S) that the scheduler is running.
+Combined with `PLIC_MX_THRESH = 0` (which allows ESP-IDF interrupts like the interrupt
+watchdog to fire), the real FreeRTOS ISR hooks attempt stack switching with our fake TCB.
+
+The real FreeRTOS hooks do NOT manage `_tx_thread_system_state` (that's only in our
+custom `rtos_int_hooks.S`). So any ESP-IDF interrupt going through the real FreeRTOS path
+leaves ThreadX's ISR nesting state inconsistent — ThreadX doesn't know an ISR is active,
+and kernel APIs may attempt illegal operations.
+
+Additionally, if the SYSTIMER interrupt (vector[17]) nests inside a real-FreeRTOS-handled
+ESP-IDF interrupt, the ThreadX `_tx_thread_context_restore` idle path jumps directly to
+`_tx_thread_schedule`, abandoning the outer ESP-IDF interrupt's stack frame entirely.
+
+**Contrast with old working state**: Before the WiFi port, the threadx_demo had:
+- `port_xSchedulerRunning = 0` (real FreeRTOS default — no ISR stack switching)
+- `PLIC threshold = 1` (only SYSTIMER at priority 2 fires, no ESP-IDF interrupts)
+- No ESP-IDF interrupt interference whatsoever
+
+**Fix**: Separated ISR initialization into a weak/strong function pattern:
+
+1. **`tx_port_startup.c`** (shared threadx component):
+   - Removed `port_xSchedulerRunning`, `pxCurrentTCBs`, `s_current_task_sp_save` declarations
+   - Added weak noop: `__attribute__((weak)) void _tx_port_esp_idf_isr_init(void) { }`
+   - Calls `_tx_port_esp_idf_isr_init()` in `tx_application_define` (after compat layer init)
+
+2. **`tx_esp32c6_timer.c`** (shared threadx component):
+   - Removed `PLIC_MX_THRESH = 0` — timer only configures SYSTIMER (priority 2 > default threshold 1)
+   - Timer code is now decoupled from port-level interrupt policy
+
+3. **`port.c`** (custom FreeRTOS component — wifi_demo only):
+   - Added strong override: `void _tx_port_esp_idf_isr_init(void)` that sets
+     `PLIC_MX_THRESH = 0` and `port_xSchedulerRunning = 1`
+
+**Result** (verified via symbol table):
+
+| Binary | `_tx_port_esp_idf_isr_init` | `port_xSchedulerRunning` | `pxCurrentTCBs` |
+|--------|---------------------------|-------------------------|----------------|
+| threadx_demo | W (weak noop) | B (BSS=0, real FreeRTOS) | B (BSS=0, real FreeRTOS) |
+| wifi_demo | T (strong, sets thresh+flag) | D (our rtos_int_hooks.S) | D (points to save area) |
+
+- **threadx_demo**: PLIC threshold stays 1, only SYSTIMER fires, no ISR stack switching. **Fixed — boots and runs.**
+- **wifi_demo**: PLIC threshold 0, all ESP-IDF interrupts fire, ISR stack switching active. **Builds successfully — WiFi scanning issue still present (same as before Bug 40).**
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `components/threadx/port/tx_port_startup.c` | Removed port_xSchedulerRunning/pxCurrentTCBs setup; added weak `_tx_port_esp_idf_isr_init()` |
+| `components/threadx/port/tx_esp32c6_timer.c` | Removed PLIC_MX_THRESH=0; renumbered steps 4a-4e → 3a-3e |
+| `components/freertos/threadx/src/port.c` | Added strong `_tx_port_esp_idf_isr_init()` with PLIC threshold + scheduler flag |
+
+### Key Lesson
+
+Port-specific ISR integration (PLIC threshold, ISR stack switching flags) must live in the
+component that owns the ISR hooks, not in the shared threadx kernel component. When multiple
+demos link against different FreeRTOS implementations (real vs custom), setting symbols in
+shared code writes to different underlying storage with completely different semantics.
+
+---
+
+## WiFi Demo — Remaining Issue (Not Yet Resolved)
+
+**Status**: WiFi scanning stuck on channel 1 / esp_timer not firing. The PLIC threshold
+fix (Bug 39) is correctly applied via `_tx_port_esp_idf_isr_init()`, but the underlying
+WiFi scanning issue persists. This is a separate problem from the threadx_demo hang
+(Bug 40) and requires further investigation.
+
+**Symptoms observed**:
+- WiFi starts successfully (past "wifi:enable tsf")
+- Scan #1 returns 21 results (all channel 1)
+- Scans 2-3 return 0 results
+- esp_timer diagnostic timer never fires
+- SCAN_DONE event appears to be delivered for scan #1 but subsequent scans fail
+
+**Possible next steps for investigation**:
+1. Verify PLIC threshold is actually 0 at runtime (add diagnostic readback in app_main)
+2. Check if esp_timer interrupt is actually allocated and its PLIC line is enabled
+3. Verify `_tx_thread_system_state` tracking is correct during WiFi ISRs (Bug 36 fix)
+4. Check if the rtos_int_exit SP restore from pxCurrentTCBs is corrupting ThreadX thread state
+5. Consider whether portYIELD_FROM_ISR being a no-op prevents timely ISR→thread notification
+
+---

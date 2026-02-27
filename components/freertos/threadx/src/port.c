@@ -22,6 +22,37 @@
 /* ThreadX internal: non-zero when in ISR or initialization context */
 extern volatile ULONG _tx_thread_system_state;
 
+/* ISR stack switching state (defined in rtos_int_hooks.S) */
+extern volatile uint32_t port_xSchedulerRunning;
+
+/* PLIC MX threshold register (direct address for ESP32-C6) */
+#define PLIC_MX_THRESH_REG  (*(volatile uint32_t *)(0x20001000 + 0x90))
+
+/* ── ESP-IDF ISR initialization ─────────────────────────────────── *
+ * Strong override of the weak noop in tx_port_startup.c.
+ * Called from tx_application_define() before the scheduler starts.
+ *
+ * Sets up two things needed for ESP-IDF interrupt coexistence:
+ *
+ * 1. PLIC threshold = 0: ESP-IDF startup sets threshold = 1
+ *    (RVHAL_INTR_ENABLE_THRESH). esp_intr_alloc() assigns priority 1
+ *    by default, so all ESP-IDF interrupts (esp_timer, WiFi, BLE)
+ *    are masked when threshold = 1. Setting threshold to 0 allows
+ *    all interrupts with priority >= 1 to fire. Our SYSTIMER uses
+ *    priority 2, so it still fires. MIE = 0 during this call (Bug 29
+ *    fix), so nothing fires until the scheduler enables MIE via mret.
+ *
+ * 2. port_xSchedulerRunning = 1: tells rtos_int_enter/rtos_int_exit
+ *    (rtos_int_hooks.S) to perform ISR stack switching. Without this,
+ *    ESP-IDF interrupts would run on whatever stack happens to be
+ *    active, which could overflow a ThreadX thread stack.
+ */
+void _tx_port_esp_idf_isr_init(void)
+{
+    PLIC_MX_THRESH_REG = 0;
+    port_xSchedulerRunning = 1;
+}
+
 /* ── Yield ───────────────────────────────────────────────────────── */
 
 void vPortYield(void)
@@ -40,20 +71,22 @@ void vPortYield(void)
  */
 
 /* ── vTaskSwitchContext ──────────────────────────────────────────── *
- * Called from rtos_int_exit (rtos_int_hooks.S) when xPortSwitchFlag
- * indicates a context switch is pending. In real FreeRTOS this selects
- * the highest-priority ready task and updates pxCurrentTCBs.
+ * In real FreeRTOS, called from rtos_int_exit when xPortSwitchFlag is set.
+ * Selects the highest-priority ready task for context switch.
  *
- * For ThreadX, context switching is handled by the ThreadX scheduler
- * (_tx_thread_schedule / _tx_thread_context_restore). This stub exists
- * to satisfy the linker. When we add WiFi interrupt routing through
- * ESP-IDF's vectors.S, this will need to integrate with ThreadX's
- * preemption mechanism.
+ * For ThreadX, preemption is handled by the ThreadX scheduler internally.
+ * When tx_semaphore_put (or other TX API) resumes a higher-priority thread
+ * during an ISR, _tx_thread_execute_ptr is updated. The actual context
+ * switch happens at the next ThreadX timer tick (vector[17]) via
+ * _tx_thread_context_save/_tx_thread_context_restore.
+ *
+ * This stub exists for the rtos_int_exit xPortSwitchFlag path (currently
+ * dead code since portYIELD_FROM_ISR is a no-op) and to satisfy the linker.
  */
 void vTaskSwitchContext(int xCoreID)
 {
     (void)xCoreID;
-    /* ThreadX handles context switches internally */
+    /* ThreadX handles context switches via _tx_thread_system_preempt_check */
 }
 
 /* ── ISR context detection ───────────────────────────────────────── */

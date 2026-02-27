@@ -44,28 +44,24 @@ static const char *TAG = "threadx_startup";
 extern void app_main(void);
 
 /* FreeRTOS compat layer init (from tx_freertos.c).
- * Must be called after kernel init — creates heap pool and idle task. */
-extern UINT tx_freertos_init(void);
+ * Must be called after kernel init — creates heap pool and idle task.
+ * Weak: allows threadx_demo (no compat layer) to link without it. */
+__attribute__((weak)) UINT tx_freertos_init(void) { return TX_SUCCESS; }
 
 /* Scheduler state flag (defined in tx_freertos.c).
  * Must be set to 1 before the scheduler starts so that
  * xTaskGetSchedulerState() returns RUNNING (not NOT_STARTED)
- * once threads are actually executing. */
-extern UINT txfr_scheduler_started;
+ * once threads are actually executing.
+ * Weak: defaults to 0 if compat layer not linked. */
+UINT txfr_scheduler_started __attribute__((weak)) = 0;
 
-/* ESP-IDF interrupt dispatch state (defined in rtos_int_hooks.S).
- * port_xSchedulerRunning must be set to 1 when the scheduler is active
- * so rtos_int_enter/rtos_int_exit perform ISR stack switching.
- * pxCurrentTCBs must point to a structure whose offset 0 is the saved SP.
- * rtos_int_enter saves SP to pxCurrentTCBs[0]->offset0 and switches to
- * the ISR stack; rtos_int_exit restores SP from there. */
-extern volatile uint32_t port_xSchedulerRunning;
-extern volatile uint32_t *pxCurrentTCBs;
-
-/* Simple "fake TCB" — just a single word holding the saved SP.
- * pxCurrentTCBs points here. rtos_int_enter stores SP at offset 0,
- * rtos_int_exit loads it back. Single-core, so one word suffices. */
-static uint32_t s_current_task_sp_save;
+/* Port-specific ESP-IDF ISR initialization.
+ * Weak default: noop for threadx_demo (no custom FreeRTOS component).
+ * Strong override in components/freertos/threadx/src/port.c for wifi_demo:
+ *   - Sets PLIC threshold to 0 (so ESP-IDF interrupts with priority >= 1 fire)
+ *   - Sets port_xSchedulerRunning = 1 (enables ISR stack switching)
+ * Called from tx_application_define before the scheduler starts (MIE=0). */
+__attribute__((weak)) void _tx_port_esp_idf_isr_init(void) { }
 
 /* System byte pool for dynamic allocations */
 #define SYSTEM_BYTE_POOL_SIZE   CONFIG_THREADX_BYTE_POOL_SIZE
@@ -153,13 +149,11 @@ void tx_application_define(void *first_unused_memory)
      * APIs (locks, semaphores) need this to know they can use ThreadX. */
     txfr_scheduler_started = 1u;
 
-    /* Enable ESP-IDF interrupt dispatch stack switching.
-     * rtos_int_enter/rtos_int_exit (rtos_int_hooks.S) check these to decide
-     * whether to save/restore SP and switch to the ISR stack.
-     * pxCurrentTCBs points to our fake TCB (just a SP save slot).
-     * port_xSchedulerRunning tells the hooks the scheduler is active. */
-    pxCurrentTCBs = &s_current_task_sp_save;
-    port_xSchedulerRunning = 1u;
+    /* Initialize ESP-IDF ISR integration (PLIC threshold, ISR stack switching).
+     * Weak default is a noop (for threadx_demo). The custom FreeRTOS component
+     * provides a strong override that sets PLIC threshold=0 and enables
+     * port_xSchedulerRunning for ISR stack switching (for wifi_demo). */
+    _tx_port_esp_idf_isr_init();
 
     ESP_LOGI(TAG, "ThreadX application defined — main thread created");
 }

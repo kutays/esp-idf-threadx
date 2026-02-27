@@ -125,13 +125,12 @@ extern void vPortYield(void);
  * scheduler (modifies _tx_thread_current_ptr while ISR context save/restore
  * expects it stable).
  *
- * Fix: No-op. ThreadX handles preemption automatically — _tx_thread_context_restore
- * (called at every timer tick) checks if a higher-priority thread became ready and
- * performs the context switch. Trade-off: up to 10ms (one tick @ 100 Hz) latency
- * for ISR-to-thread wakeup, which is acceptable for WiFi/BLE events.
- *
- * Future: implement xPortSwitchFlag + vTaskSwitchContext integration with
- * rtos_int_exit for lower-latency ISR-triggered context switches.
+ * Fix: No-op. rtos_int_exit calls _tx_thread_system_preempt_check() when
+ * exiting the last ISR nesting level. This checks _tx_thread_execute_ptr
+ * (updated by tx_semaphore_put etc. during the ISR) against _tx_thread_current_ptr.
+ * If a higher-priority thread became ready, it triggers _tx_thread_system_return()
+ * which saves a solicited context frame and enters the ThreadX scheduler. No
+ * xPortSwitchFlag flag is needed — ThreadX's own execute_ptr handles everything.
  */
 #undef portYIELD_FROM_ISR
 #undef portEND_SWITCHING_ISR

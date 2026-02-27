@@ -531,3 +531,404 @@ the first schedule-in, the CPU jumps to the thread function.
 
 It also sets `mstatus.MPIE = 1` so that `mret` enables interrupts for the new
 thread (since `mret` sets `mstatus.MIE = mstatus.MPIE`).
+
+---
+
+## rtos_int_hooks.S — ESP-IDF Interrupt Dispatch Hooks
+
+Source: `components/freertos/threadx/src/rtos_int_hooks.S` (our file).
+
+This file provides `rtos_int_enter` and `rtos_int_exit` — two functions called by
+ESP-IDF's `_interrupt_handler` (in `esp-idf/components/riscv/vectors.S`) for ALL
+non-ThreadX interrupts (WiFi, Bluetooth, UART, esp_timer, GPIO, etc.).
+
+### Why This File Exists
+
+The ESP32-C6 has TWO completely separate interrupt paths:
+
+```
+Path A — ThreadX Timer (CPU line 17):
+  vector[17] → _tx_esp32c6_trap_handler → _tx_thread_context_save
+    → _tx_esp32c6_timer_isr → _tx_thread_context_restore
+
+Path B — All ESP-IDF Interrupts (CPU lines ≠ 17):
+  vector[N] → _interrupt_handler → rtos_int_enter
+    → _global_interrupt_handler → rtos_int_exit
+```
+
+Path A uses ThreadX's native interrupt context save/restore (saves all registers in a
+32*REGBYTES "interrupt frame", type=1). Path B uses ESP-IDF's `save_general_regs` /
+`restore_general_regs` macros (different layout, `RV_STK_*` offsets).
+
+`rtos_int_hooks.S` bridges Path B into the ThreadX world by:
+1. Managing `_tx_thread_system_state` (ThreadX ISR nesting counter)
+2. Managing `port_uxInterruptNesting` (FreeRTOS compat counter)
+3. Switching to/from the ISR stack
+4. Checking for preemption on ISR exit
+
+### Calling Convention
+
+From ESP-IDF's `vectors.S`, the hooks are called like this:
+
+```asm
+_interrupt_handler:                     # vectors.S (ESP-IDF code, NOT ours)
+    save_general_regs                   # Push all 31 regs (RV_STK layout)
+    csrr  s1, mcause                   # s1 = interrupt cause (callee-saved!)
+    csrr  s2, mstatus                  # s2 = saved mstatus  (callee-saved!)
+    call  rtos_int_enter               # OUR HOOK — returns "context" in a0
+    mv    s4, a0                       # s4 = context        (callee-saved!)
+
+    # ... raise PLIC threshold, enable MIE, dispatch ISR, disable MIE ...
+
+    mv    a0, s2                       # a0 = saved mstatus
+    mv    a1, s4                       # a1 = context from rtos_int_enter
+    call  rtos_int_exit                # OUR HOOK — returns mstatus in a0
+
+    csrw  mstatus, a0                  # Restore mstatus (MIE=0 at this point)
+    restore_general_regs               # Pop all 31 regs
+    mret                               # Return to interrupted code
+```
+
+Key: `_interrupt_handler` saves mcause/mstatus in `s1`/`s2` (callee-saved registers).
+These survive all function calls including our hooks. After `rtos_int_exit` returns,
+`_interrupt_handler` restores mstatus from `a0` (our return value), restores all
+registers, and does `mret`.
+
+### rtos_int_enter — Annotated Line by Line
+
+```asm
+rtos_int_enter:
+    lw      t0, port_xSchedulerRunning   # t0 = scheduler running flag
+    #   Absolute address load — port_xSchedulerRunning is a .data symbol.
+    #   The assembler generates a lui+lw pair (position-dependent).
+    beqz    t0, .Lenter_end              # If scheduler not running, skip everything.
+    #   Before tx_kernel_enter() completes, we must not touch any ThreadX
+    #   state. Just return 0 and let _interrupt_handler continue.
+```
+
+**Increment FreeRTOS compat nesting counter:**
+```asm
+    la      t3, port_uxInterruptNesting  # t3 = address of nesting counter
+    #   'la' = load address (lui+addi pair). We need the ADDRESS to both
+    #   read and write the counter.
+    lw      t4, 0(t3)                   # t4 = current nesting depth
+    addi    t5, t4, 1                   # t5 = nesting + 1
+    sw      t5, 0(t3)                   # Store incremented nesting
+```
+
+**Increment ThreadX system state (Bug 36 fix):**
+```asm
+    la      t3, _tx_thread_system_state  # t3 = address of system state
+    lw      t5, 0(t3)                   # t5 = current system state
+    addi    t5, t5, 1                   # t5 = system_state + 1
+    sw      t5, 0(t3)                   # Store incremented state
+    #   CRITICAL: ThreadX APIs check _tx_thread_system_state to determine
+    #   if they're called from ISR context. If this is 0 during an ISR,
+    #   tx_semaphore_put() thinks it's in thread context and calls
+    #   _tx_thread_system_return(), corrupting the scheduler (Bug 36).
+```
+
+**Stack switch (first-level interrupt only):**
+```asm
+    bnez    t4, .Lenter_end              # t4 = nesting BEFORE increment.
+    #   If t4 > 0, we're nested — already on ISR stack, skip switch.
+
+    lw      t0, pxCurrentTCBs           # t0 = pointer to current TCB
+    #   Absolute address load of the TCB pointer variable.
+    beqz    t0, .Lenter_end              # Defensive: no current task
+    sw      sp, 0(t0)                   # TCB->pxTopOfStack = sp
+    #   Save current stack pointer into the TCB. FreeRTOS convention:
+    #   offset 0 of TCB = pxTopOfStack. vectors.S relies on this for
+    #   context restore.
+    lw      sp, xIsrStackTop            # Switch SP to top of ISR stack
+    #   ISR stack is a separate 4KB region (.bss). Stack grows DOWN,
+    #   so xIsrStackTop = xIsrStack + 4096.
+```
+
+**Return:**
+```asm
+.Lenter_end:
+    li      a0, 0                       # Return 0 (no coprocessors on C6)
+    ret                                 # Return to _interrupt_handler
+```
+
+### rtos_int_exit — Annotated Line by Line (Bug 37 Fix)
+
+This is the critical function. It must:
+1. Restore nesting counters
+2. Switch back to the task stack (if exiting last ISR level)
+3. Check if a higher-priority thread became ready during the ISR
+4. Trigger a context switch if needed — WITHOUT corrupting registers
+
+```asm
+rtos_int_exit:
+    mv      s11, a0                     # s11 = saved mstatus
+    #   a0 comes from _interrupt_handler: it's the mstatus value saved on
+    #   interrupt entry (before the ISR ran). We need to return this value
+    #   at the end so _interrupt_handler can restore it via csrw mstatus.
+    #
+    #   WHY s11? Because s11 is callee-saved (RISC-V ABI). It survives:
+    #     - Our function calls (obvious)
+    #     - _tx_thread_system_preempt_check()
+    #     - _tx_thread_system_return() (saves s11 in solicited frame)
+    #     - The entire scheduler round-trip
+    #     - _tx_thread_synch_return (restores s11 from solicited frame)
+    #   When the original thread resumes, s11 still holds our mstatus.
+```
+
+**Check scheduler running:**
+```asm
+    lw      t0, port_xSchedulerRunning
+    beqz    t0, .Lexit_end              # Not running — return mstatus
+```
+
+**Decrement FreeRTOS compat nesting:**
+```asm
+    la      t2, port_uxInterruptNesting
+    lw      t3, 0(t2)                   # t3 = current nesting
+    beqz    t3, .Lskip_dec              # Guard: don't go below 0
+    addi    t3, t3, -1
+    sw      t3, 0(t2)                   # t3 now = nesting AFTER decrement
+.Lskip_dec:
+```
+
+**Decrement ThreadX system state:**
+```asm
+    la      t2, _tx_thread_system_state
+    lw      t4, 0(t2)
+    beqz    t4, .Lskip_sys_dec          # Guard: don't go below 0
+    addi    t4, t4, -1
+    sw      t4, 0(t2)
+.Lskip_sys_dec:
+```
+
+**Check if we're still nested:**
+```asm
+    bnez    t3, .Lexit_end              # t3 = nesting AFTER decrement.
+    #   If still > 0, we're inside a nested ISR. Stay on ISR stack,
+    #   don't check for preemption (an outer rtos_int_exit will handle it).
+```
+
+**The preemption check (Bug 37 fix):**
+```asm
+    # ═══════════════════════════════════════════════════════════════════
+    # EXITING LAST ISR LEVEL
+    #
+    # At this point:
+    #   _tx_thread_system_state = 0   (just decremented)
+    #   We're still on the ISR stack  (rtos_int_enter switched us)
+    #
+    # _tx_thread_system_preempt_check() is a C function that:
+    #   1. Reads _tx_thread_system_state + _tx_thread_preempt_disable
+    #   2. If both are 0 AND execute_ptr != current_ptr:
+    #      Calls _tx_thread_system_return() → scheduler → other thread runs
+    #   3. When our thread resumes: returns normally
+    #
+    # We need to save/restore ra because 'call' overwrites it.
+    # ═══════════════════════════════════════════════════════════════════
+
+    addi    sp, sp, -16                 # Allocate 16 bytes (aligned)
+    sw      ra, 0(sp)                   # Save return address
+    call    _tx_thread_system_preempt_check
+    #   This call may:
+    #   (a) Return immediately — no preemption needed. Fast path.
+    #   (b) Call _tx_thread_system_return() internally, which:
+    #       - Saves a solicited frame (type=0) on THIS stack
+    #       - Stores SP in our TCB
+    #       - Switches to system stack
+    #       - Jumps to _tx_thread_schedule (never returns directly)
+    #       - When we're re-scheduled: _tx_thread_synch_return restores
+    #         our callee-saved regs (including s11 = mstatus) and does
+    #         `ret` which returns HERE, to the lw instruction below.
+    lw      ra, 0(sp)                   # Restore return address
+    addi    sp, sp, 16                  # Free stack frame
+```
+
+**Return:**
+```asm
+.Lexit_end:
+    mv      a0, s11                     # Return mstatus in a0
+    #   _interrupt_handler will: csrw mstatus, a0 (sets MIE=0, MPIE=saved)
+    #   then: restore_general_regs, mret (MPIE→MIE, restoring original state)
+    ret
+```
+
+### Why This Works: The Callee-Saved Register Chain
+
+The entire mechanism relies on callee-saved register preservation through multiple
+function boundaries:
+
+```
+_interrupt_handler saves mstatus in s2        (callee-saved)
+  ↓
+rtos_int_exit copies s2 → a0, then a0 → s11  (callee-saved)
+  ↓
+_tx_thread_system_preempt_check preserves s11 (C calling convention)
+  ↓
+_tx_thread_system_return saves s11 at 1*REGBYTES(sp) in solicited frame
+  ↓
+... scheduler runs other thread(s) ...
+  ↓
+_tx_thread_synch_return loads s11 from 1*REGBYTES(sp)
+  ↓
+ret → back in rtos_int_exit, s11 still = original mstatus
+  ↓
+rtos_int_exit returns a0 = s11 = original mstatus
+  ↓
+_interrupt_handler: csrw mstatus, a0 → restore_general_regs → mret
+```
+
+No register is lost. No context format conversion is needed. The solicited frame
+contains only callee-saved registers, which is exactly what we need because we're
+inside a C function call chain.
+
+---
+
+## tx_thread_system_return.S — Solicited Context Save
+
+Source: upstream file (risc-v64/gnu port). Called when a thread voluntarily gives up
+the CPU (via `_tx_thread_system_preempt_check`, `tx_thread_sleep`, etc.).
+
+The key difference from interrupt context save:
+
+| | Interrupt Frame (type=1) | Solicited Frame (type=0) |
+|---|---|---|
+| Size | 32*REGBYTES (128 bytes on RV32) | 16*REGBYTES (64 bytes on RV32) |
+| Registers saved | ALL 31 + mepc | Only s0-s11, ra, mstatus (14 regs) |
+| Resume mechanism | Full restore + `mret` | Callee-saved restore + `ret` |
+| Who creates it | `_tx_thread_context_save` | `_tx_thread_system_return` |
+
+**Annotated code (stripped of floating-point for clarity):**
+
+```asm
+_tx_thread_system_return:
+    addi    sp, sp, -16*REGBYTES        # Allocate solicited frame
+
+    STORE   x0,  0(sp)                  # type = 0 (solicited marker)
+    #   _tx_thread_schedule checks this: 0 → synch_return, non-0 → full restore
+
+    STORE   x1,  13*REGBYTES(sp)        # Save ra  (return address)
+    STORE   x8,  12*REGBYTES(sp)        # Save s0  (frame pointer)
+    STORE   x9,  11*REGBYTES(sp)        # Save s1
+    STORE   x18, 10*REGBYTES(sp)        # Save s2
+    STORE   x19,  9*REGBYTES(sp)        # Save s3
+    STORE   x20,  8*REGBYTES(sp)        # Save s4
+    STORE   x21,  7*REGBYTES(sp)        # Save s5
+    STORE   x22,  6*REGBYTES(sp)        # Save s6
+    STORE   x23,  5*REGBYTES(sp)        # Save s7
+    STORE   x24,  4*REGBYTES(sp)        # Save s8
+    STORE   x25,  3*REGBYTES(sp)        # Save s9
+    STORE   x26,  2*REGBYTES(sp)        # Save s10
+    STORE   x27,  1*REGBYTES(sp)        # Save s11  ← THIS IS OUR mstatus!
+    csrr    t0, mstatus
+    STORE   t0, 14*REGBYTES(sp)         # Save mstatus (interrupt enable state)
+
+    csrci   mstatus, 0xF                # Disable all interrupts
+
+    # Save SP into current thread's TCB:
+    la      t0, _tx_thread_current_ptr
+    LOAD    t1, 0(t0)                   # t1 = current thread TCB
+    STORE   sp, 2*REGBYTES(t1)          # TCB->tx_thread_stack_ptr = sp
+
+    # Switch to system stack:
+    la      t2, _tx_thread_system_stack_ptr
+    LOAD    sp, 0(t2)                   # sp = system stack
+
+    # Clear current thread pointer:
+    STORE   x0, 0(t0)                   # _tx_thread_current_ptr = NULL
+
+    # Jump to scheduler (never returns here):
+    la      t2, _tx_thread_schedule
+    jr      t2
+```
+
+### tx_thread_schedule.S — The Scheduler + synch_return
+
+**Scheduler loop:**
+```asm
+_tx_thread_schedule:
+    csrsi   mstatus, 0x08               # Enable interrupts (so timer tick works)
+
+    la      t0, _tx_thread_execute_ptr
+_tx_thread_schedule_loop:
+    LOAD    t1, 0(t0)                   # t1 = next thread to run
+    beqz    t1, _tx_thread_schedule_loop # Spin until a thread is ready
+    #   This loop runs with MIE=1, so timer interrupts can fire and
+    #   wake threads (e.g., tx_thread_sleep expiry).
+
+    csrci   mstatus, 0x08               # Disable interrupts for context switch
+
+    la      t0, _tx_thread_current_ptr
+    STORE   t1, 0(t0)                   # _tx_thread_current_ptr = t1
+
+    LOAD    sp, 2*REGBYTES(t1)          # sp = thread's saved stack pointer
+    LOAD    t2, 0(sp)                   # t2 = stack type at offset 0
+    beqz    t2, _tx_thread_synch_return  # type 0 → solicited return
+    #   type ≠ 0 → interrupt frame → full register restore + mret
+    #   (full restore code omitted for brevity — see tx_thread_schedule.S)
+```
+
+**Synchronous (solicited) return:**
+```asm
+_tx_thread_synch_return:
+    LOAD    x1,  13*REGBYTES(sp)        # Restore ra
+    LOAD    x8,  12*REGBYTES(sp)        # Restore s0
+    LOAD    x9,  11*REGBYTES(sp)        # Restore s1
+    LOAD    x18, 10*REGBYTES(sp)        # Restore s2
+    LOAD    x19,  9*REGBYTES(sp)        # Restore s3
+    LOAD    x20,  8*REGBYTES(sp)        # Restore s4
+    LOAD    x21,  7*REGBYTES(sp)        # Restore s5
+    LOAD    x22,  6*REGBYTES(sp)        # Restore s6
+    LOAD    x23,  5*REGBYTES(sp)        # Restore s7
+    LOAD    x24,  4*REGBYTES(sp)        # Restore s8
+    LOAD    x25,  3*REGBYTES(sp)        # Restore s9
+    LOAD    x26,  2*REGBYTES(sp)        # Restore s10
+    LOAD    x27,  1*REGBYTES(sp)        # Restore s11  ← OUR mstatus IS BACK!
+    LOAD    t0,  14*REGBYTES(sp)        # Restore mstatus
+    csrw    mstatus, t0                 # Write mstatus (may enable interrupts)
+    addi    sp, sp, 16*REGBYTES         # Free solicited frame
+    ret                                 # Return to caller of system_return
+    #   In our case: returns to rtos_int_exit, right after the
+    #   'call _tx_thread_system_preempt_check' instruction.
+```
+
+---
+
+## Dual Interrupt Path Summary
+
+```
+                    ┌─────────────────────┐
+                    │   CPU Interrupt      │
+                    │   Vector Table       │
+                    └─────┬───────┬───────┘
+                          │       │
+                   vector[17]   vector[N≠17]
+                          │       │
+                   ┌──────┴──┐  ┌─┴──────────────┐
+                   │ ThreadX │  │ ESP-IDF         │
+                   │ Timer   │  │ _interrupt_handler│
+                   │ Path A  │  │ Path B          │
+                   └────┬────┘  └────┬────────────┘
+                        │            │
+              context_save    rtos_int_enter
+              (system_state++) (system_state++)
+                        │            │
+              timer_isr        _global_interrupt_handler
+                        │      (WiFi, BT, UART, esp_timer...)
+                        │            │
+              context_restore  rtos_int_exit
+              (system_state--) (system_state--)
+              checks preempt   checks preempt via
+              via execute_ptr  _tx_thread_system_preempt_check
+                        │            │
+                   ┌────┴────────────┴────┐
+                   │   Both paths correctly│
+                   │   trigger context     │
+                   │   switch when needed  │
+                   └──────────────────────┘
+```
+
+Both paths maintain `_tx_thread_system_state` in sync. Both check for preemption
+when exiting the last ISR nesting level. Cross-path nesting works correctly:
+- ESP-IDF ISR → ThreadX timer nests: state goes 1→2→1→0 (correct)
+- ThreadX timer → ESP-IDF ISR nests: state goes 1→2→1→0 (correct)

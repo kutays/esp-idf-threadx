@@ -167,6 +167,15 @@ void _tx_port_setup_timer_interrupt(void)
     /* Step 3: Configure CPU interrupt line 17 via direct PLIC registers  */
     /* ------------------------------------------------------------------ */
 
+    /* NOTE: PLIC threshold is NOT set here. The default threshold from
+     * ESP-IDF startup is 1 (RVHAL_INTR_ENABLE_THRESH). Our SYSTIMER uses
+     * priority 2 (> threshold 1), so it fires regardless.
+     *
+     * For WiFi/BLE demos that need ESP-IDF interrupts (allocated at priority
+     * 1 by esp_intr_alloc), the custom FreeRTOS component sets PLIC threshold
+     * to 0 via _tx_port_esp_idf_isr_init(). This keeps the timer code
+     * decoupled from port-level interrupt policy. */
+
     /* 3a. LEVEL-triggered mode (matches FreeRTOS vSystimerSetup):
      *     Leave TYPE bit 17 = 0 (level). Do NOT set it to edge.
      *     With level-triggered: PLIC asserts mip.bit17 continuously while
@@ -175,7 +184,7 @@ void _tx_port_setup_timer_interrupt(void)
      *     edge if the output is already HIGH when the PLIC is enabled/configured. */
     PLIC_MX_TYPE &= ~(1u << TIMER_CPU_INT_NUM);   /* clear bit 17 = level */
 
-    /* 3b. Priority 2 — must be > PLIC threshold (FreeRTOS sets it to 1) */
+    /* 3b. Priority 2 — must be > PLIC threshold (default 1, or 0 if wifi port) */
     PLIC_MX_PRI_N = TIMER_CPU_INT_PRIORITY;
 
     /* 3c. Ensure interrupt 17 is handled in machine mode (not delegated).

@@ -6,7 +6,7 @@
  *   - ISR nesting counter (port_uxInterruptNesting)
  *   - ThreadX system state (_tx_thread_system_state) — CRITICAL for Bug 36
  *   - Stack switching (task stack → ISR stack on first-level interrupt)
- *   - Context switch check on ISR exit
+ *   - Context switch check on ISR exit (xPortSwitchFlag + vTaskSwitchContext)
  *
  * Calling convention (from vectors.S):
  *   rtos_int_enter:
@@ -18,7 +18,8 @@
  *     - a0 = saved mstatus (to restore after ISR)
  *     - a1 = context from rtos_int_enter (unused on ESP32-C6)
  *     - Returns new mstatus in a0
- *     - Restores SP from task TCB (may be different task if switch occurred)
+ *     - At last ISR level: checks xPortSwitchFlag, calls vTaskSwitchContext,
+ *       then ALWAYS restores SP from pxCurrentTCBs (matching FreeRTOS pattern)
  *
  * Global variables:
  *   port_xSchedulerRunning    — non-zero when ThreadX scheduler is active
@@ -26,7 +27,7 @@
  *   _tx_thread_system_state   — ThreadX ISR nesting (Bug 36: MUST be >0 in ISR)
  *   xPortSwitchFlag           — set by portYIELD_FROM_ISR to request switch
  *   port_uxCriticalNesting    — critical section nesting (for FreeRTOS compat)
- *   pxCurrentTCBs             — pointer to current task TCB (offset 0 = saved SP)
+ *   pxCurrentTCBs             — pointer to SP save area (offset 0 = saved SP)
  *   xIsrStackTop              — top of ISR stack
  *
  * These match the names used by ESP-IDF's real FreeRTOS port, so that
@@ -39,15 +40,15 @@
  * attempt immediate preemption via _tx_thread_system_return(), which corrupts
  * the scheduler because it runs on the ISR stack, not the thread stack.
  *
- * ThreadX's own timer ISR path (vector[17]) manages _tx_thread_system_state via
- * _tx_thread_context_save (increment) and _tx_thread_context_restore (decrement).
- * The ESP-IDF path (vector[N≠17]) goes through _interrupt_handler → rtos_int_enter
- * → handler → rtos_int_exit, which is completely separate. Both paths must keep
- * _tx_thread_system_state in sync:
- *   - ThreadX timer nests into ESP-IDF ISR: state goes 1→2 (context_save) then 2→1
- *     (context_restore), then 1→0 (rtos_int_exit). Correct.
- *   - ESP-IDF ISR only: state goes 0→1 (rtos_int_enter), APIs see ISR context,
- *     then 1→0 (rtos_int_exit). Correct.
+ * ISR exit follows the FreeRTOS pattern (not ThreadX _tx_thread_system_preempt_check):
+ *   1. Decrement nesting counters
+ *   2. At last ISR level: check xPortSwitchFlag → vTaskSwitchContext
+ *   3. Restore SP from pxCurrentTCBs (undoes the stack switch from rtos_int_enter)
+ *
+ * Bug 37 lesson: DO NOT call _tx_thread_system_preempt_check() from rtos_int_exit.
+ * That function calls _tx_thread_system_return() which creates a "solicited" context
+ * frame on the ISR stack — fundamentally incompatible with ESP-IDF's interrupt frame
+ * format. The two frame types are different sizes and layouts, causing corruption.
  */
 
     .section .text
@@ -55,6 +56,7 @@
 
     /* ThreadX system state — defined in ThreadX common/src/tx_thread_initialize.c */
     .extern _tx_thread_system_state
+    .extern vTaskSwitchContext
 
 /* ── rtos_int_enter ──────────────────────────────────────────────── */
     .global rtos_int_enter
@@ -82,12 +84,12 @@ rtos_int_enter:
     /* If already nested (t4 > 0), skip stack switch */
     bnez    t4, .Lenter_end
 
-    /* First-level interrupt: save current SP in TCB, switch to ISR stack.
-     * pxCurrentTCBs points to the current task's TCB. By FreeRTOS convention,
-     * offset 0 of TCB = pxTopOfStack (the saved stack pointer). */
+    /* First-level interrupt: save current SP in save area, switch to ISR stack.
+     * pxCurrentTCBs points to a save area whose first word is the saved SP.
+     * This matches the FreeRTOS TCB layout (offset 0 = pxTopOfStack). */
     lw      t0, pxCurrentTCBs
-    beqz    t0, .Lenter_end             /* Defensive: no current task */
-    sw      sp, 0(t0)                   /* TCB->pxTopOfStack = sp */
+    beqz    t0, .Lenter_end             /* Defensive: no save area */
+    sw      sp, 0(t0)                   /* save_area[0] = sp */
     lw      sp, xIsrStackTop            /* Switch to ISR stack */
 
 .Lenter_end:
@@ -99,8 +101,11 @@ rtos_int_enter:
 /* ── rtos_int_exit ───────────────────────────────────────────────── */
     .global rtos_int_exit
     .type   rtos_int_exit, @function
+
 rtos_int_exit:
-    /* Save mstatus (a0) in callee-saved register */
+    /* Save mstatus (a0) in callee-saved register s11.
+     * s11 is saved/restored by vectors.S save_general_regs/restore_general_regs,
+     * so it's preserved across the entire ISR handler. */
     mv      s11, a0
 
     /* Check if scheduler is running */
@@ -125,32 +130,37 @@ rtos_int_exit:
     sw      t4, 0(t2)
 .Lskip_sys_dec:
 
-    /* If still nested, keep ISR stack */
+    /* If still nested (nesting > 0), keep ISR stack — skip switch check */
     bnez    t3, .Lexit_end
 
-    /* Exiting last ISR level — check for pending context switch */
+    /* Exiting last ISR level.
+     * Check xPortSwitchFlag — set by portYIELD_FROM_ISR when an ISR handler
+     * wants to trigger a context switch. Call vTaskSwitchContext if set.
+     * Currently portYIELD_FROM_ISR is a no-op and vTaskSwitchContext is a stub,
+     * so this path is effectively dead code. It's kept for FreeRTOS pattern
+     * compatibility and future ISR-level preemption support. */
     la      t0, xPortSwitchFlag
     lw      t2, 0(t0)
     beqz    t2, .Lno_switch
 
-    /* Context switch requested — call vTaskSwitchContext.
-     * This updates pxCurrentTCBs to point to the next task to run. */
+    /* Context switch requested — call vTaskSwitchContext, then clear flag.
+     * Save/restore ra on stack (we're still on ISR stack here). */
     addi    sp, sp, -16
     sw      ra, 0(sp)
-    li      a0, 0                       /* core ID = 0 */
+    li      a0, 0                       /* xCoreID = 0 */
     call    vTaskSwitchContext
     lw      ra, 0(sp)
     addi    sp, sp, 16
-
-    /* Clear switch flag */
     la      t0, xPortSwitchFlag
-    sw      zero, 0(t0)
+    sw      zero, 0(t0)                 /* Clear the flag */
 
 .Lno_switch:
-    /* Restore task SP from (possibly new) current TCB */
+    /* ALWAYS restore SP from pxCurrentTCBs at last ISR level exit.
+     * This undoes the stack switch done in rtos_int_enter.
+     * Matches the real FreeRTOS rtos_int_exit pattern exactly. */
     lw      t0, pxCurrentTCBs
-    beqz    t0, .Lexit_end              /* Defensive: no current task */
-    lw      sp, 0(t0)                   /* sp = TCB->pxTopOfStack */
+    beqz    t0, .Lexit_end              /* Defensive: no save area */
+    lw      sp, 0(t0)                   /* Restore task SP from save area */
 
 .Lexit_end:
     mv      a0, s11                     /* Return mstatus */
@@ -189,15 +199,29 @@ port_uxCriticalNesting:
     .word   0
     .size   port_uxCriticalNesting, 4
 
-    /* pxCurrentTCBs — pointer to current task TCB.
-     * For ThreadX, we maintain this to point at a structure whose
-     * first member (offset 0) is the saved stack pointer. This matches
-     * the FreeRTOS TCB layout that vectors.S expects. */
+    /* pxCurrentTCBs — pointer to SP save area.
+     * Points to _current_task_sp_save, a single word that holds the saved SP.
+     * rtos_int_enter writes the task SP here before switching to ISR stack.
+     * rtos_int_exit reads it back to restore the task SP.
+     *
+     * This matches the FreeRTOS TCB layout where offset 0 = pxTopOfStack.
+     * On single-core ESP32-C6, only one thread can be interrupted at a time,
+     * so a single save word (not per-thread) is sufficient.
+     *
+     * ESP-IDF components (espcoredump, gdbstub) reference pxCurrentTCBs
+     * to find the current task's stack — the save area satisfies this. */
+    .global _current_task_sp_save
+    .type   _current_task_sp_save, @object
+    .align  4
+_current_task_sp_save:
+    .word   0                           /* Saved task SP (written by rtos_int_enter) */
+    .size   _current_task_sp_save, 4
+
     .global pxCurrentTCBs
     .type   pxCurrentTCBs, @object
     .align  4
 pxCurrentTCBs:
-    .word   0
+    .word   _current_task_sp_save       /* Points to save area (non-NULL when linked) */
     .size   pxCurrentTCBs, 4
 
     /* ISR stack — allocate a dedicated stack for interrupt handlers.

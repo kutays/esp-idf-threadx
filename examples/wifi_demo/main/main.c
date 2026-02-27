@@ -19,6 +19,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "tx_api.h"
 
@@ -39,12 +40,21 @@ static const char *TAG = "wifi_demo";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 
+/* Scan-done semaphore — signaled by WIFI_EVENT_SCAN_DONE handler */
+static TX_SEMAPHORE scan_done_sem;
+
+/* ── Diagnostic: does esp_timer work? ──────────────────────────── */
+static void diag_timer_cb(void *arg)
+{
+    ESP_LOGI(TAG, "[diag] esp_timer fired! tick=%lu", (unsigned long)tx_time_get());
+}
+
 /* ── WiFi scanner thread (ThreadX native) ──────────────────────── */
 
 #define SCANNER_STACK_SIZE  4096
 #define SCANNER_PRIORITY    20      /* Lower priority than main (16) */
 #define SCAN_INTERVAL_TICKS 1500    /* 15 seconds at 100 Hz tick rate */
-#define MAX_SCAN_RESULTS    15
+#define MAX_SCAN_RESULTS    20
 
 static TX_THREAD scanner_thread;
 static UCHAR scanner_stack[SCANNER_STACK_SIZE];
@@ -79,10 +89,10 @@ static void scanner_thread_entry(ULONG param)
         ESP_LOGI(TAG, "[scanner] === Scan #%lu starting (tick=%lu) ===",
                  (unsigned long)scan_num, (unsigned long)tx_time_get());
 
-        /* Non-blocking scan + sleep. We avoid block=true because the
-         * internal blocking semaphore in esp_wifi_scan_start depends on
-         * WiFi event dispatch that may not fully work through the compat
-         * layer yet. Instead: start scan, sleep while hardware scans,
+        /* Non-blocking scan + wait for SCAN_DONE event.
+         * We use non-blocking because blocking mode has a known issue
+         * (internal semaphore not posted through compat layer). Instead:
+         * start scan, wait for WIFI_EVENT_SCAN_DONE via our semaphore,
          * then collect results. */
         wifi_scan_config_t scan_config = {
             .ssid = NULL,
@@ -94,6 +104,9 @@ static void scanner_thread_entry(ULONG param)
             .scan_time.active.max = 300,
         };
 
+        /* Drain any stale semaphore counts from previous scans */
+        while (tx_semaphore_get(&scan_done_sem, TX_NO_WAIT) == TX_SUCCESS) {}
+
         esp_err_t err = esp_wifi_scan_start(&scan_config, false /* non-blocking */);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "[scanner] Scan failed: %s", esp_err_to_name(err));
@@ -101,13 +114,26 @@ static void scanner_thread_entry(ULONG param)
             continue;
         }
 
-        /* Wait for scan to complete. Active scan across all channels
-         * typically takes 1-3 seconds. 5 seconds is generous. */
-        tx_thread_sleep(500);  /* 5 seconds */
+        /* Wait for WIFI_EVENT_SCAN_DONE (timeout 10s).
+         * Active scan: 13 channels × 300ms max = ~4s + overhead.
+         * On timeout, still try to read results (diagnostic). */
+        UINT sem_status = tx_semaphore_get(&scan_done_sem, 1000);
+        if (sem_status != TX_SUCCESS) {
+            ESP_LOGW(TAG, "[scanner] No SCAN_DONE in 10s — reading results anyway (diagnostic)");
+        } else {
+            ESP_LOGI(TAG, "[scanner] SCAN_DONE received at tick=%lu",
+                     (unsigned long)tx_time_get());
+        }
 
         /* Get results */
         uint16_t ap_count = 0;
         esp_wifi_scan_get_ap_num(&ap_count);
+
+        if (ap_count == 0) {
+            ESP_LOGW(TAG, "[scanner] No networks found (ap_count=0)");
+            tx_thread_sleep(SCAN_INTERVAL_TICKS);
+            continue;
+        }
 
         uint16_t fetch_count = (ap_count > MAX_SCAN_RESULTS) ? MAX_SCAN_RESULTS : ap_count;
         wifi_ap_record_t *ap_records = malloc(fetch_count * sizeof(wifi_ap_record_t));
@@ -142,7 +168,23 @@ static void scanner_thread_entry(ULONG param)
     }
 }
 
-/* ── WiFi event handler ────────────────────────────────────────── */
+/* ── WiFi event handlers ───────────────────────────────────────── */
+
+/* Debug: log ALL WiFi events to understand event dispatch timing */
+static void wifi_any_event_handler(void *arg, esp_event_base_t event_base,
+                                    int32_t event_id, void *event_data)
+{
+    if (event_id == WIFI_EVENT_SCAN_DONE) {
+        wifi_event_sta_scan_done_t *info = (wifi_event_sta_scan_done_t *)event_data;
+        ESP_LOGI(TAG, "[event] SCAN_DONE status=%lu count=%u tick=%lu",
+                 (unsigned long)info->status, info->number,
+                 (unsigned long)tx_time_get());
+        tx_semaphore_put(&scan_done_sem);
+    } else {
+        ESP_LOGI(TAG, "[event] WIFI id=%ld tick=%lu",
+                 (long)event_id, (unsigned long)tx_time_get());
+    }
+}
 
 static void event_handler(void *arg, esp_event_base_t event_base,
                            int32_t event_id, void *event_data)
@@ -181,6 +223,14 @@ static void wifi_init_sta(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    /* Create scan-done semaphore (initial count 0) */
+    tx_semaphore_create(&scan_done_sem, "scan_done", 0);
+
+    /* Register handler for ALL WiFi events — diagnostic + SCAN_DONE semaphore */
+    esp_event_handler_instance_t wifi_event_instance;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_any_event_handler, NULL, &wifi_event_instance));
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
@@ -223,6 +273,46 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* Diagnostic: esp_timer hardware state.
+     * esp_timer uses SYSTIMER alarm 2 → SYSTIMER_TARGET2 → interrupt source 59.
+     * Check if the interrupt is properly routed and enabled. */
+    {
+        /* INTMTX: source 59 → which CPU line? */
+        volatile uint32_t *intmtx_59 = (volatile uint32_t *)(0x60010000 + 59 * 4);
+        uint32_t cpu_line = *intmtx_59;
+
+        /* PLIC ENABLE bitmask */
+        volatile uint32_t *plic_enable = (volatile uint32_t *)0x20001000;
+        uint32_t enable_val = *plic_enable;
+
+        /* mie CSR */
+        uint32_t mie_val;
+        __asm__ volatile("csrr %0, mie" : "=r"(mie_val));
+
+        ESP_LOGI(TAG, "[diag] INTMTX src59 (esp_timer) → CPU line %lu", (unsigned long)cpu_line);
+        ESP_LOGI(TAG, "[diag] PLIC ENABLE = 0x%08lx (line %lu bit = %lu)",
+                 (unsigned long)enable_val, (unsigned long)cpu_line,
+                 (unsigned long)((enable_val >> cpu_line) & 1));
+        ESP_LOGI(TAG, "[diag] mie = 0x%08lx (line %lu bit = %lu)",
+                 (unsigned long)mie_val, (unsigned long)cpu_line,
+                 (unsigned long)((mie_val >> cpu_line) & 1));
+
+        /* SYSTIMER INT_ENA for alarm 2 (bit 2) */
+        volatile uint32_t *systimer_int_ena = (volatile uint32_t *)(0x6000A000 + 0x64);
+        ESP_LOGI(TAG, "[diag] SYSTIMER INT_ENA = 0x%08lx (bit2=alarm2=%lu)",
+                 (unsigned long)*systimer_int_ena, (unsigned long)((*systimer_int_ena >> 2) & 1));
+    }
+
+    /* Also test esp_timer from our (post-ThreadX) context */
+    esp_timer_handle_t diag_timer;
+    esp_timer_create_args_t diag_args = {
+        .callback = diag_timer_cb,
+        .name = "diag",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&diag_args, &diag_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(diag_timer, 2000000)); /* 2 seconds */
+    ESP_LOGI(TAG, "Diagnostic esp_timer started (should fire every 2s)");
 
     ESP_LOGI(TAG, "NVS initialized, starting WiFi...");
     wifi_init_sta();

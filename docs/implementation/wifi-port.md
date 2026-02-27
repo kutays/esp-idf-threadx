@@ -3440,3 +3440,279 @@ ThreadX compat layer:
 | 33 | 28 | Hang at "ThreadX taking over" | `PERIPH_RCC_ACQUIRE_ATOMIC` → `portEXIT_CRITICAL` → MIE=1 during init | Remove call; bus clock already enabled |
 | 34 | 29 | Hang at "wifi:enable tsf" | Vector table dead-loops for non-17 interrupts | Route all vectors to `_interrupt_handler`; enable ISR stack switching |
 | 35 | 30 | Freeze after tick 32-33 | `portYIELD_FROM_ISR` calls thread-level `tx_thread_relinquish()` from ISR | Change to no-op; ThreadX preempts at timer tick |
+
+---
+
+## Iteration 31 — Bug 36: `_tx_thread_system_state` Not Set During ESP-IDF ISRs
+
+### The Symptom
+
+After fixing Bug 35 (`portYIELD_FROM_ISR` no-op), the system no longer crashed
+immediately at tick 32-33. However, it still froze shortly after — both threads
+printed once (tick=32 main, tick=33 scanner) and then stopped forever. The timer
+tick appeared to stop firing entirely.
+
+```
+I (810) wifi_demo: WiFi STA init complete, connection attempt in background...
+I (820) wifi_demo: Scanner thread created (ThreadX prio 20)
+I (820) wifi_demo: [main] tick=32 thread='main' wifi_bits=0x0 retries=0
+I (830) wifi_demo: [scanner] Background WiFi scanner started (ThreadX thread, tick=33)
+<... system freezes — no more output ...>
+```
+
+### Diagnosis: The Two Nesting Counter Problem
+
+The key question was: why does the timer stop firing after the first WiFi interrupt?
+
+We verified (via agent search) that the `mie` CSR is NOT being modified by ESP-IDF's
+interrupt allocation. `rv_utils_intr_enable/disable` only touch `PLIC_MXINT_ENABLE_REG`
+(0x20001000), not individual `mie` bits. Our `mie bit 17` is preserved.
+
+The real culprit was `_tx_thread_system_state` — ThreadX's ISR nesting counter.
+
+ThreadX uses `_tx_thread_system_state` (defined in `tx_thread_initialize.c`) to track
+whether the CPU is executing in ISR context. Every ThreadX API checks this variable:
+
+- `_tx_thread_system_state == 0` → thread context → immediate preemption allowed
+- `_tx_thread_system_state > 0` → ISR context → defer preemption
+
+The ThreadX timer ISR path (vector[17]) manages this correctly:
+- `_tx_thread_context_save` increments `_tx_thread_system_state`
+- `_tx_thread_context_restore` decrements it
+
+But the ESP-IDF interrupt path (vector[N≠17]) goes through `_interrupt_handler` →
+`rtos_int_enter` → handler → `rtos_int_exit`. Our `rtos_int_enter`/`rtos_int_exit`
+managed `port_uxInterruptNesting` (the FreeRTOS compat counter) but **never touched
+`_tx_thread_system_state`**.
+
+### Root Cause: ThreadX APIs Think They're in Thread Context During WiFi ISR
+
+When a WiFi ISR fires and calls FreeRTOS compat APIs (e.g., `xSemaphoreGive` →
+`tx_semaphore_put`), the following happens:
+
+```
+WiFi ISR (on ISR stack, entered via _interrupt_handler)
+  │
+  │ port_uxInterruptNesting = 1  ← rtos_int_enter set this
+  │ _tx_thread_system_state = 0  ← NEVER INCREMENTED!
+  │
+  ├→ xSemaphoreGive(wifi_sem)
+  │   └→ tx_semaphore_put(sem)
+  │       └→ _tx_thread_system_resume(waiting_thread)
+  │           │
+  │           │ Checks: _tx_thread_system_state == 0
+  │           │ Thinks: "I'm in thread context"
+  │           │ Action: IMMEDIATE preemption via _tx_thread_system_return()
+  │           │
+  │           └→ _tx_thread_system_return()
+  │               ├→ Saves SP (ISR stack!) as thread's stack pointer
+  │               ├→ Switches to ThreadX system stack
+  │               └→ Enters _tx_thread_schedule → HANGS or corrupts
+```
+
+`_tx_thread_system_resume()` (called internally by `tx_semaphore_put`) checks
+`_tx_thread_system_state` to decide whether to preempt immediately or defer:
+
+```c
+// Inside _tx_thread_system_resume (ThreadX common source):
+if (_tx_thread_system_state != 0)
+{
+    // ISR context — just update _tx_thread_execute_ptr, defer switch
+    _tx_thread_execute_ptr = highest_priority_ready;
+    return;
+}
+// Thread context — preempt immediately
+if (new_thread->priority < current_thread->priority)
+{
+    _tx_thread_system_return();  // ← Context switch NOW
+}
+```
+
+With `_tx_thread_system_state == 0` during the WiFi ISR, ThreadX calls
+`_tx_thread_system_return()` from ISR context. This function:
+
+1. Saves the current SP (which is the **ISR stack**, not the thread stack) into
+   `_tx_thread_current_ptr->tx_thread_stack_ptr` — corrupting the thread's saved SP
+2. Switches to the ThreadX system stack
+3. Calls `_tx_thread_schedule` to pick the next thread
+4. The corrupted thread can never be properly restored
+
+### The Fix
+
+Added `_tx_thread_system_state` increment/decrement to `rtos_int_hooks.S`:
+
+**`rtos_int_enter` — after incrementing `port_uxInterruptNesting`:**
+```asm
+    /* Bug 36: Increment ThreadX system state so TX APIs know we're in ISR.
+     * Without this, tx_semaphore_put etc. see system_state==0, think they're
+     * in thread context, and call _tx_thread_system_return() — corrupting
+     * the scheduler because we're actually on the ISR stack. */
+    la      t3, _tx_thread_system_state
+    lw      t5, 0(t3)
+    addi    t5, t5, 1
+    sw      t5, 0(t3)
+```
+
+**`rtos_int_exit` — after decrementing `port_uxInterruptNesting`:**
+```asm
+    /* Bug 36: Decrement ThreadX system state (mirrors the increment in
+     * rtos_int_enter). This restores the system_state to its pre-ISR value
+     * so ThreadX APIs return to normal thread-context behavior. */
+    la      t2, _tx_thread_system_state
+    lw      t4, 0(t2)
+    beqz    t4, .Lskip_sys_dec
+    addi    t4, t4, -1
+    sw      t4, 0(t2)
+.Lskip_sys_dec:
+```
+
+### Nesting Correctness
+
+Both increment/decrement paths must be consistent when ThreadX timer ISRs nest
+into ESP-IDF ISRs:
+
+```
+Thread running: _tx_thread_system_state = 0
+  │
+  ├→ WiFi IRQ fires (vector[N])
+  │   rtos_int_enter: state 0 → 1
+  │   │
+  │   ├→ ThreadX timer IRQ nests (vector[17], MIE re-enabled by _interrupt_handler)
+  │   │   _tx_thread_context_save: state 1 → 2
+  │   │   timer ISR runs
+  │   │   _tx_thread_context_restore: state 2 → 1
+  │   │   mret → back to WiFi handler
+  │   │
+  │   WiFi handler continues
+  │   Any ThreadX API sees state=1 → defers preemption ✓
+  │   rtos_int_exit: state 1 → 0
+  │
+  Thread resumes: _tx_thread_system_state = 0 ✓
+```
+
+The two increment/decrement pairs (ThreadX context_save/restore + our
+rtos_int_enter/exit) compose correctly for any nesting scenario.
+
+### Result: WiFi Scanning Working on ThreadX
+
+After this fix, the system ran continuously without freezing:
+
+```
+I (820) wifi_demo: [main] tick=32 thread='main' wifi_bits=0x0 retries=0
+I (830) wifi_demo: [scanner] Background WiFi scanner started (ThreadX thread, tick=33)
+...
+I (7819) wifi_demo: [scanner] Found 17 networks (showing 15):
+I (7819) wifi_demo: [scanner]  SSID                              RSSI  Auth             Channel
+I (7829) wifi_demo: [scanner]  Flat 4                             -83  WPA2/WPA3-PSK    1
+I (7829) wifi_demo: [scanner]  Flat 12                            -84  WPA2/WPA3-PSK    1
+I (7839) wifi_demo: [scanner]  PLUSNET-68F9Q5                     -84  WPA2-PSK         1
+I (7849) wifi_demo: [scanner]  Flat 6                             -84  WPA2/WPA3-PSK    1
+...
+```
+
+This demonstrates:
+- **ThreadX timer tick** running continuously at 100 Hz
+- **Multi-thread scheduling** — main thread (prio 16) and scanner thread (prio 20)
+  interleaving correctly with proper sleep/wake timing
+- **WiFi hardware** — radio scanning all channels, returning real AP records
+- **ESP-IDF interrupt dispatch** — WiFi ISRs handled via `_interrupt_handler` without
+  corrupting ThreadX scheduler state
+- **FreeRTOS compat layer** — `xEventGroupCreate`, `xEventGroupGetBits`, `malloc/free`,
+  `esp_wifi_*` APIs all working through the ThreadX-backed compatibility layer
+- **Dual interrupt path** — vector[17] (ThreadX timer) and vector[N≠17] (ESP-IDF WiFi)
+  coexisting safely with synchronized `_tx_thread_system_state` management
+
+### Known Issue: Blocking Scan Timeout
+
+`esp_wifi_scan_start(&config, true)` (blocking mode) times out after ~12 seconds
+instead of returning scan results. The non-blocking approach works correctly:
+
+```c
+esp_wifi_scan_start(&scan_config, false);  // start scan, return immediately
+tx_thread_sleep(500);                       // wait 5s for hardware to finish
+esp_wifi_scan_get_ap_num(&ap_count);        // collect results
+esp_wifi_scan_get_ap_records(&count, recs);
+```
+
+**Why blocking mode fails:** `esp_wifi_scan_start(block=true)` internally waits on
+a FreeRTOS semaphore that is posted when the WiFi event system delivers
+`WIFI_EVENT_SCAN_DONE`. The scan done notification flows through:
+
+1. WiFi hardware completes scan
+2. WiFi ISR signals internal WiFi task
+3. WiFi task calls `esp_event_post(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, ...)`
+4. Event loop task receives and dispatches the event
+5. Internal WiFi event handler posts the scan-done semaphore
+6. `esp_wifi_scan_start` (blocked on semaphore) wakes up
+
+Something in this chain — likely the event loop task dispatching to the internal
+WiFi event handler, or the semaphore wake mechanism — doesn't work correctly
+through the compat layer. The non-blocking workaround avoids the entire chain.
+
+**Investigation TODO:** Trace the event dispatch chain to find where the scan-done
+notification gets lost. Likely candidates:
+- `xQueueSend`/`xQueueReceive` in the event loop task (queue compat)
+- The internal WiFi default event handler registration (may need explicit compat)
+- Semaphore `xSemaphoreGive` from the event handler task context (non-ISR, should work)
+
+### Summary of Changes — Iteration 31
+
+**Files modified:**
+
+| File | Change | Bug |
+|------|--------|-----|
+| `rtos_int_hooks.S` | Added `_tx_thread_system_state` increment in `rtos_int_enter` and decrement in `rtos_int_exit` | Bug 36 |
+| `main.c` | Scan-only mode: commented out connection code, non-blocking scan, removed `xEventGroupWaitBits` gate | Demo |
+
+**Bug Summary:**
+
+| Bug # | Symptom | Root Cause | Fix |
+|-------|---------|------------|-----|
+| 36 | System freezes after tick 32-33 (again, but different cause than Bug 35) | `_tx_thread_system_state` not set during ESP-IDF ISRs → ThreadX APIs attempt immediate preemption from ISR context | Increment/decrement `_tx_thread_system_state` in `rtos_int_enter`/`rtos_int_exit` |
+
+### Cumulative Bug Table — Iterations 28-31
+
+| Bug # | Iteration | Symptom | Root Cause | Fix |
+|-------|-----------|---------|------------|-----|
+| 33 | 28 | Hang at "ThreadX taking over" | `PERIPH_RCC_ACQUIRE_ATOMIC` → MIE=1 during init | Remove call; bus clock already enabled |
+| 34 | 29 | Hang at "wifi:enable tsf" | Vector table dead-loops for non-17 interrupts | Route all vectors to `_interrupt_handler` |
+| 35 | 30 | Freeze after tick 32-33 | `portYIELD_FROM_ISR` calls `tx_thread_relinquish()` from ISR | Change to no-op `((void)0)` |
+| 36 | 31 | Freeze after tick 32-33 (different root cause) | `_tx_thread_system_state` not managed in ESP-IDF ISR path | Increment/decrement in `rtos_int_enter`/`rtos_int_exit` |
+
+### WiFi Port Milestone
+
+**WiFi scanning confirmed working on ThreadX as of Iteration 31.**
+
+The ESP32-C6 WiFi hardware, ESP-IDF WiFi driver stack, and ThreadX RTOS are
+successfully coexisting:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    APPLICATION                           │
+│  main_thread (ThreadX prio 16) — status monitor         │
+│  scanner_thread (ThreadX prio 20) — WiFi scan + print   │
+├─────────────────────────────────────────────────────────┤
+│              FREERTOS COMPAT LAYER                       │
+│  xEventGroupCreate, xSemaphore*, xTaskCreate, etc.       │
+│  backed by ThreadX primitives (tx_semaphore, tx_thread)  │
+├─────────────────────────────────────────────────────────┤
+│                ESP-IDF COMPONENTS                         │
+│  esp_wifi, esp_event, esp_netif, nvs_flash, lwip         │
+│  (all using FreeRTOS APIs → routed through compat layer) │
+├─────────────────────────────────────────────────────────┤
+│              INTERRUPT DISPATCH                          │
+│  vector[17] → ThreadX timer (100 Hz SYSTIMER tick)       │
+│  vector[N]  → ESP-IDF _interrupt_handler (WiFi, etc.)    │
+│  _tx_thread_system_state synchronized across both paths  │
+├─────────────────────────────────────────────────────────┤
+│                 THREADX KERNEL                           │
+│  Scheduler, timer, semaphores, byte pools, threads       │
+│  Running on ESP32-C6 RISC-V via risc-v64/gnu port        │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Remaining work:**
+- Fix blocking scan (`esp_wifi_scan_start(block=true)`) — event dispatch chain issue
+- STA connection mode — uncomment connection code with real credentials
+- Test `xEventGroupWaitBits` with real WiFi events (connect/disconnect/IP)
+- Verify phase 0 (basic ThreadX demo without WiFi) still works
