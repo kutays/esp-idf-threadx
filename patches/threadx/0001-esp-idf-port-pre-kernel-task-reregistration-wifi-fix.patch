@@ -1,0 +1,301 @@
+diff --git a/ports/risc-v64/gnu/src/tx_thread_context_restore.S b/ports/risc-v64/gnu/src/tx_thread_context_restore.S
+index d805a59c..a3392dc8 100644
+--- a/ports/risc-v64/gnu/src/tx_thread_context_restore.S
++++ b/ports/risc-v64/gnu/src/tx_thread_context_restore.S
+@@ -260,7 +260,7 @@ _tx_thread_no_preempt_restore:
+     /* Restore registers,
+        Skip global pointer because that does not change */
+ 
+-    LOAD    t0, 240(sp)                                 // Recover mepc
++    LOAD    t0, 30*REGBYTES(sp)                         // Recover mepc (30*REGBYTES: 120 on RV32, 240 on RV64)
+     csrw    mepc, t0                                    // Setup mepc
+     li      t0, 0x1880                                  // Prepare MPIP
+ #if defined(__riscv_float_abi_single) || defined(__riscv_float_abi_double)
+diff --git a/utility/rtos_compatibility_layers/FreeRTOS/FreeRTOS.h b/utility/rtos_compatibility_layers/FreeRTOS/FreeRTOS.h
+index 3245c8c6..9ecf9373 100644
+--- a/utility/rtos_compatibility_layers/FreeRTOS/FreeRTOS.h
++++ b/utility/rtos_compatibility_layers/FreeRTOS/FreeRTOS.h
+@@ -178,6 +178,10 @@ struct txfr_task {
+     uint8_t clear_on_pend;
+     uint32_t clear_mask;
+     uint8_t allocated;
++    // ESP-IDF compat: expression_with_stack.c accesses these FreeRTOS
++    // StaticTask_t fields (pxStack / pxEndOfStack) by opaque name.
++    void *pxDummy6;
++    void *pxDummy8;
+ };
+ 
+ typedef txfr_task_t StaticTask_t;
+@@ -192,6 +196,9 @@ typedef struct txfr_sem {
+     uint8_t allocated;
+     uint8_t is_mutex;
+     txfr_queueset_t *p_set;
++    // ESP-IDF compat: FreeRTOS_POSIX_mqueue.c uses designated initializer
++    // { { 0 }, .u = { 0 } } matching real FreeRTOS StaticQueue_t layout.
++    union { UBaseType_t uxDummy2; } u;
+ } txfr_sem_t;
+ 
+ typedef txfr_sem_t *SemaphoreHandle_t;
+diff --git a/utility/rtos_compatibility_layers/FreeRTOS/tx_freertos.c b/utility/rtos_compatibility_layers/FreeRTOS/tx_freertos.c
+index b400cf86..adca403a 100644
+--- a/utility/rtos_compatibility_layers/FreeRTOS/tx_freertos.c
++++ b/utility/rtos_compatibility_layers/FreeRTOS/tx_freertos.c
+@@ -41,6 +41,9 @@
+ 
+ #include <stdint.h>
+ #include <limits.h>
++#ifdef ESP_PLATFORM
++#include <stdlib.h>
++#endif /* ESP_PLATFORM */
+ 
+ #include <tx_api.h>
+ #include <tx_thread.h>
+@@ -71,10 +74,37 @@ static TX_BYTE_POOL txfr_heap;
+ static UINT txfr_heap_initialized;
+ #if (TX_FREERTOS_AUTO_INIT == 1)
+ static UINT txfr_initialized;
+-static UINT txfr_scheduler_started;
+ #endif // #if (TX_FREERTOS_AUTO_INIT == 1)
++/* Always track scheduler state — needed by xTaskGetSchedulerState()
++ * for newlib locks to correctly no-op during early boot. */
++UINT txfr_scheduler_started;
++
++#ifdef ESP_PLATFORM
++/* Forward declaration for pre-kernel re-registration */
++void txfr_thread_wrapper(ULONG id);
++
++/* Pre-kernel task re-registration.
++ *
++ * ESP-IDF secondary init (esp_timer_init_os, newlib locks, etc.) calls
++ * xTaskCreate() BEFORE tx_kernel_enter(). tx_kernel_enter() then calls
++ * _tx_thread_initialize() which clears _tx_thread_created_ptr,
++ * _tx_thread_priority_list, and all priority maps — orphaning these tasks.
++ * Without this fix: ISRs put to notification semaphores (count increments)
++ * but no thread ever wakes, so esp_timer callbacks and WiFi scan completion
++ * never fire.
++ *
++ * We track pre-kernel tasks here and re-register them properly in
++ * tx_freertos_init() (called from tx_application_define, after ThreadX
++ * kernel init but before the scheduler starts).
++ *
++ * txfr_pre_kernel_tracking: 1 while pre-kernel tracking is active (before
++ * tx_freertos_init() runs), 0 after (normal post-kernel task creation). */
++#define TXFR_MAX_PRE_KERNEL_TASKS  8
++static txfr_task_t *txfr_pre_kernel_tasks[TXFR_MAX_PRE_KERNEL_TASKS];
++static int txfr_pre_kernel_task_count;
++static UINT txfr_pre_kernel_tracking = 1u;  /* Starts active, cleared in tx_freertos_init */
++#endif /* ESP_PLATFORM */
+ 
+-// TODO - do something with malloc.
+ void *txfr_malloc(size_t len)
+ {
+     void *p;
+@@ -85,22 +115,40 @@ void *txfr_malloc(size_t len)
+         if(ret != TX_SUCCESS) {
+             return NULL;
+         }
++        return p;
+     } else {
++#ifdef ESP_PLATFORM
++        /* Use ESP-IDF heap (malloc) as fallback before the compat layer byte
++         * pool is created. This allows ESP-IDF init functions (newlib stdio,
++         * locks) to create FreeRTOS objects during early boot before
++         * tx_kernel_enter(). */
++        return malloc(len);
++#else
+         return NULL;
++#endif /* ESP_PLATFORM */
+     }
+-
+-    return p;
+ }
+ 
+ void txfr_free(void *p)
+ {
+-    UINT ret;
++    if(p == NULL) {
++        return;
++    }
+ 
+     if(txfr_heap_initialized == 1u) {
+-        ret = tx_byte_release(p);
++        UINT ret = tx_byte_release(p);
+         if(ret != TX_SUCCESS) {
++#ifdef ESP_PLATFORM
++            /* Pointer was allocated via malloc() fallback — free it normally */
++            free(p);
++#else
+             TX_FREERTOS_ASSERT_FAIL();
++#endif /* ESP_PLATFORM */
+         }
++    } else {
++#ifdef ESP_PLATFORM
++        free(p);
++#endif /* ESP_PLATFORM */
+     }
+ 
+     return;
+@@ -192,6 +240,12 @@ UINT tx_freertos_init(void)
+ {
+     UINT ret;
+ 
++#ifdef ESP_PLATFORM
++    /* Stop pre-kernel tracking — tasks created after this point are within
++     * the live ThreadX kernel and need no special re-registration. */
++    txfr_pre_kernel_tracking = 0u;
++#endif /* ESP_PLATFORM */
++
+ #ifdef configTOTAL_HEAP_SIZE
+     if(configTOTAL_HEAP_SIZE > 0u) {
+         ret = tx_byte_pool_create(&txfr_heap, "txfr_byte_pool", txfr_heap_mem, configTOTAL_HEAP_SIZE);
+@@ -202,6 +256,60 @@ UINT tx_freertos_init(void)
+     }
+ #endif
+ 
++#ifdef ESP_PLATFORM
++    /* Re-register tasks that were created before tx_kernel_enter().
++     *
++     * ESP-IDF secondary init calls xTaskCreate() before tx_kernel_enter().
++     * tx_kernel_enter() calls _tx_thread_initialize() which clears
++     * _tx_thread_created_ptr, _tx_thread_priority_list, and priority maps,
++     * orphaning those pre-kernel tasks. Without this fix they never run:
++     * ISRs put to their notification semaphores (count increments) but no
++     * thread ever wakes, so esp_timer callbacks and WiFi scan completion
++     * never fire.
++     *
++     * Fix: re-create each pre-kernel task's TX_THREAD and TX_SEMAPHORE
++     * within the live ThreadX kernel so they are properly tracked and
++     * scheduled. The txfr_task_t (including stack and function pointer)
++     * is intact from the original allocation — we just re-initialize the
++     * ThreadX-managed control structures. */
++    for(int i = 0; i < txfr_pre_kernel_task_count; i++) {
++        txfr_task_t *p_task = txfr_pre_kernel_tasks[i];
++
++        /* Read stack parameters before re-creating (fields survive _tx_thread_initialize) */
++        void  *stack_start = p_task->thread.tx_thread_stack_start;
++        ULONG  stack_size  = p_task->thread.tx_thread_stack_size;
++        CHAR  *name        = p_task->thread.tx_thread_name;
++        UINT   prio        = p_task->thread.tx_thread_priority;
++
++        /* Clear ID so tx_thread_create accepts the already-allocated TCB */
++        p_task->thread.tx_thread_id = 0u;
++
++        ret = tx_thread_create(&p_task->thread, name, txfr_thread_wrapper,
++                (ULONG)p_task->p_task_arg, stack_start, stack_size,
++                prio, prio, 0u, TX_DONT_START);
++        if(ret != TX_SUCCESS) {
++            /* Log via panic — this is a fatal init failure */
++            TX_FREERTOS_ASSERT_FAIL();
++            continue;
++        }
++        p_task->thread.txfr_thread_ptr = p_task;
++
++        /* Re-create notification semaphore (cleared by _tx_semaphore_initialize) */
++        p_task->notification_sem.tx_semaphore_id = 0u;
++        ret = tx_semaphore_create(&p_task->notification_sem, "", 0u);
++        if(ret != TX_SUCCESS) {
++            TX_FREERTOS_ASSERT_FAIL();
++            (void)tx_thread_terminate(&p_task->thread);
++            (void)tx_thread_delete(&p_task->thread);
++            continue;
++        }
++
++        /* Make thread ready to run */
++        (void)tx_thread_resume(&p_task->thread);
++    }
++    txfr_pre_kernel_task_count = 0;
++#endif /* ESP_PLATFORM */
++
+ #if (INCLUDE_vTaskDelete == 1)
+     ret = tx_semaphore_create(&txfr_idle_sem, "txfr_idle_semaphore", 0u);
+     if(ret != TX_SUCCESS) {
+@@ -271,8 +379,8 @@ void vPortExitCritical(void)
+ 
+ void vTaskStartScheduler(void)
+ {
+-#if (TX_FREERTOS_AUTO_INIT == 1)
+     txfr_scheduler_started = 1u;
++#if (TX_FREERTOS_AUTO_INIT == 1)
+     _tx_thread_schedule();
+ #else
+     // Nothing to do, THREADX scheduler is already started.
+@@ -282,11 +390,13 @@ void vTaskStartScheduler(void)
+ 
+ BaseType_t xTaskGetSchedulerState(void)
+ {
+-#if (TX_FREERTOS_AUTO_INIT == 1)
++    /* Always check scheduler state — not just when AUTO_INIT=1.
++     * During early boot (before tx_kernel_enter), newlib locks call this
++     * to decide whether to no-op. Must return NOT_STARTED so locks
++     * don't try to use FreeRTOS semaphore APIs before ThreadX is ready. */
+     if(txfr_scheduler_started == 0u) {
+         return taskSCHEDULER_NOT_STARTED;
+     }
+-#endif
+     if(_tx_thread_preempt_disable > 0u) {
+         return taskSCHEDULER_SUSPENDED;
+     } else {
+@@ -425,8 +535,7 @@ BaseType_t xTaskCreate(TaskFunction_t pvTaskCode,
+ 
+     p_task = txfr_malloc(sizeof(txfr_task_t));
+     if(p_task == NULL) {
+-        txfr_free(p_stack);
+-        return errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY;
++        goto err_free_stack;
+     }
+ 
+     *pxCreatedTask = p_task;
+@@ -438,10 +547,8 @@ BaseType_t xTaskCreate(TaskFunction_t pvTaskCode,
+ 
+     ret = tx_semaphore_create(&p_task->notification_sem, "", 0u);
+     if(ret != TX_SUCCESS) {
+-        txfr_free(p_stack);
+-        txfr_free(p_task);
+         TX_FREERTOS_ASSERT_FAIL();
+-        return (BaseType_t)NULL;
++        goto err_free_task;
+     }
+ 
+     prio = txfr_prio_fr_to_tx(uxPriority);
+@@ -449,11 +556,8 @@ BaseType_t xTaskCreate(TaskFunction_t pvTaskCode,
+     ret = tx_thread_create(&p_task->thread, (CHAR *)pcName, txfr_thread_wrapper, (ULONG)pvParameters,
+             p_stack, stack_depth_bytes, prio, prio, 0u, TX_DONT_START);
+     if(ret != TX_SUCCESS) {
+-        (void)tx_semaphore_delete(&p_task->notification_sem);
+-        txfr_free(p_stack);
+-        txfr_free(p_task);
+         TX_FREERTOS_ASSERT_FAIL();
+-        return (BaseType_t)NULL;
++        goto err_delete_sem;
+     }
+ 
+     p_task->thread.txfr_thread_ptr = p_task;
+@@ -463,11 +567,28 @@ BaseType_t xTaskCreate(TaskFunction_t pvTaskCode,
+         TX_FREERTOS_ASSERT_FAIL();
+     }
+ 
++#ifdef ESP_PLATFORM
++    /* Track tasks created before tx_freertos_init() (pre-kernel).
++     * _tx_thread_initialize() will clear ThreadX's tracking of these tasks.
++     * tx_freertos_init() re-registers them so they run properly. */
++    if(txfr_pre_kernel_tracking != 0u && txfr_pre_kernel_task_count < TXFR_MAX_PRE_KERNEL_TASKS) {
++        txfr_pre_kernel_tasks[txfr_pre_kernel_task_count++] = p_task;
++    }
++#endif /* ESP_PLATFORM */
++
+     TX_DISABLE;
+     g_txfr_task_count++;
+     TX_RESTORE;
+ 
+     return pdPASS;
++
++err_delete_sem:
++    (void)tx_semaphore_delete(&p_task->notification_sem);
++err_free_task:
++    txfr_free(p_task);
++err_free_stack:
++    txfr_free(p_stack);
++    return errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY;
+ }
+ 
+ 
