@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * portable.h — FreeRTOS portable layer stub for ThreadX compat
  *

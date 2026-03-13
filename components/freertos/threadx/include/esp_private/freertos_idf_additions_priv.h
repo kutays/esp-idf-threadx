@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * freertos_idf_additions_priv.h — Stub for ESP-IDF private FreeRTOS additions
  *

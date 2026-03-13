@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * This file is a placeholder. The application demos live under examples/:
  *

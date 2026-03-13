@@ -3716,3 +3716,212 @@ successfully coexisting:
 - STA connection mode — uncomment connection code with real credentials
 - Test `xEventGroupWaitBits` with real WiFi events (connect/disconnect/IP)
 - Verify phase 0 (basic ThreadX demo without WiFi) still works
+
+---
+
+## Iteration 32 — Bug 41: Pre-Kernel Task Orphaning (esp_timer / WiFi Scan Root Cause)
+
+### The Problem
+
+After Bug 40 was fixed (threadx_demo running again), the wifi_demo still showed:
+- esp_timer diagnostic callback never fires
+- WiFi scan always reports all APs on channel 1 only
+- Scans 2+ return 0 AP records
+- `SCAN_DONE` never received for subsequent scans
+
+### Root Cause Discovery
+
+The diagnostic `esp_timer` created inside `app_main` (which runs under ThreadX) worked
+fine on its own. But the **internal** esp_timer task (`esp_timer_init_os()`) is created
+during ESP-IDF **secondary init**, which runs before `esp_startup_start_app()` and thus
+before `tx_kernel_enter()`.
+
+Call chain:
+```
+esp_system_init_fn_esp_timer_init_os()  ← ESP_SYSTEM_INIT_FN (SECONDARY)
+  └── esp_timer_init_os()
+        └── xTaskCreate("esp_timer", ...)  ← creates txfr_task_t + TX_THREAD
+```
+
+Then later:
+```
+tx_kernel_enter()
+  └── _tx_thread_initialize()
+        ├── _tx_thread_created_ptr = NULL
+        ├── memset(_tx_thread_priority_list, 0)   ← orphans all pre-kernel tasks
+        └── memset(_tx_thread_priority_maps, 0)
+```
+
+The esp_timer task's `txfr_task_t` still exists in heap. Its ISR can call
+`tx_semaphore_put()` — the count increments — but the thread is never woken because it's
+not in any ready queue. Channel 1 results come from the initial scan burst before the
+timer task would normally advance to channel 2.
+
+### The Fix
+
+Modified `tx_freertos.c` to track pre-kernel tasks and re-register them after
+`tx_kernel_enter()` completes:
+
+```
+xTaskCreate (early boot, txfr_pre_kernel_tracking=1)
+  └── saves p_task in txfr_pre_kernel_tasks[]
+
+tx_freertos_init() (called from tx_application_define, after tx_kernel_enter)
+  ├── txfr_pre_kernel_tracking = 0  (stop tracking)
+  └── for each pre-kernel task:
+        ├── read {stack_start, stack_size, name, prio} from still-valid TCB
+        ├── p_task->thread.tx_thread_id = 0  (allow re-create)
+        ├── tx_thread_create(..., TX_DONT_START)  (re-register with live kernel)
+        ├── p_task->notification_sem.tx_semaphore_id = 0
+        ├── tx_semaphore_create(...)  (re-register semaphore)
+        └── tx_thread_resume(...)  (put in ready queue)
+```
+
+Key insight: `_tx_thread_initialize()` zeroes the global list/map bookkeeping but does
+NOT zero individual `TX_THREAD` structs. So `tx_thread_stack_start`, `tx_thread_stack_size`,
+`tx_thread_name`, and `tx_thread_priority` are readable from the pre-kernel TCB and can
+be used to re-create the thread correctly.
+
+All new code guarded with `#ifdef ESP_PLATFORM` to preserve portability to non-ESP targets.
+
+### Result
+
+- esp_timer callbacks fire every 2 seconds as configured
+- WiFi scan completes all 13 channels
+- `SCAN_DONE` received after each scan
+- APs reported on their actual channels
+- Both `wifi_demo` and `threadx_demo` build and run correctly
+
+### Summary of Changes — Iteration 32
+
+| File | Change | Bug |
+|------|--------|-----|
+| `components/threadx/threadx/utility/rtos_compatibility_layers/FreeRTOS/tx_freertos.c` | Pre-kernel task tracking in `xTaskCreate`; re-registration loop in `tx_freertos_init()` | Bug 41 |
+
+### Bug Summary
+
+| Bug # | Symptom | Root Cause | Fix |
+|-------|---------|------------|-----|
+| 41 | esp_timer never fires; WiFi scan stuck on channel 1 | Pre-kernel tasks orphaned by `_tx_thread_initialize()` inside `tx_kernel_enter()` | Track pre-kernel tasks; re-register them in `tx_freertos_init()` |
+
+---
+
+## Iteration 33 — Code Cleanup and Patch Infrastructure
+
+### Motivation
+
+After Bug 41's fix, several maintenance issues were addressed:
+
+1. **Submodule change management**: The threadx submodule contains ESP-IDF-specific
+   modifications that cannot yet be upstreamed. A patch workflow was established.
+
+2. **Portability**: The ESP-IDF-specific additions in `tx_freertos.c` were not guarded,
+   which would break compilation on non-ESP platforms.
+
+3. **Error handling**: `xTaskCreate` had duplicated cleanup code across multiple error paths.
+
+4. **Magic constants**: Two hardcoded tick-rate constants needed replacement.
+
+### Changes Made
+
+#### Patch Infrastructure
+
+- `patches/threadx/0001-esp-idf-port-pre-kernel-task-reregistration-wifi-fix.patch` — full
+  diff of all threadx submodule changes, regenerated to include refactoring
+- `patches/threadx/apply.sh` — script to apply patches after a fresh clone; documents
+  upstream base commit (`4b6e8100`, eclipse-threadx/threadx master) for rebasing guidance
+- `backup/wifi-fix` branch in the threadx submodule as a second safety net
+
+#### `#ifdef ESP_PLATFORM` Guards in `tx_freertos.c`
+
+All ESP-IDF-specific additions are now conditional:
+- `#include <stdlib.h>` (only needed for malloc/free fallback)
+- `txfr_malloc` / `txfr_free` fallback to `malloc`/`free` before the byte pool exists
+- Pre-kernel tracking globals (`TXFR_MAX_PRE_KERNEL_TASKS`, arrays, `txfr_pre_kernel_tracking`)
+- `txfr_pre_kernel_tracking = 0u` and re-registration loop in `tx_freertos_init()`
+- Pre-kernel tracking block in `xTaskCreate`
+
+On non-ESP platforms, `txfr_malloc` returns `NULL` when the byte pool is uninitialized
+(original upstream behaviour) and pre-kernel tracking is compiled out entirely.
+
+#### `goto err` Cascade in `xTaskCreate`
+
+Before:
+```c
+ret = tx_semaphore_create(...);
+if(ret != TX_SUCCESS) {
+    txfr_free(p_stack);        // duplicated
+    txfr_free(p_task);         // duplicated
+    TX_FREERTOS_ASSERT_FAIL();
+    return (BaseType_t)NULL;
+}
+ret = tx_thread_create(...);
+if(ret != TX_SUCCESS) {
+    (void)tx_semaphore_delete(&p_task->notification_sem);
+    txfr_free(p_stack);        // duplicated again
+    txfr_free(p_task);         // duplicated again
+    TX_FREERTOS_ASSERT_FAIL();
+    return (BaseType_t)NULL;
+}
+```
+
+After:
+```c
+ret = tx_semaphore_create(...);
+if(ret != TX_SUCCESS) { TX_FREERTOS_ASSERT_FAIL(); goto err_free_task; }
+
+ret = tx_thread_create(...);
+if(ret != TX_SUCCESS) { TX_FREERTOS_ASSERT_FAIL(); goto err_delete_sem; }
+
+... success path ...
+return pdPASS;
+
+err_delete_sem:  (void)tx_semaphore_delete(&p_task->notification_sem);
+err_free_task:   txfr_free(p_task);
+err_free_stack:  txfr_free(p_stack);
+return errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY;
+```
+
+#### `portTICK_PERIOD_MS` Fix (`portmacro.h`)
+
+```c
+// Before:
+#define portTICK_PERIOD_MS  (1000 / 100)  /* configTICK_RATE_HZ = 100 */
+
+// After:
+#define portTICK_PERIOD_MS  ((TickType_t)(1000 / configTICK_RATE_HZ))
+```
+
+The hardcoded `100` duplicated the tick rate that `FreeRTOSConfig.h` already defines.
+If `configTICK_RATE_HZ` ever changes, the old definition would silently produce the
+wrong value everywhere `portTICK_PERIOD_MS` is used.
+
+#### `SCAN_INTERVAL_TICKS` Fix (`examples/wifi_demo/main/main.c`)
+
+```c
+// Before:
+#define SCAN_INTERVAL_TICKS 1500    /* 15 seconds at 100 Hz tick rate */
+// ...
+ESP_LOGI(TAG, "Next scan in %d seconds...", SCAN_INTERVAL_TICKS / 100);
+
+// After:
+#define SCAN_INTERVAL_MS    15000
+#define SCAN_INTERVAL_TICKS pdMS_TO_TICKS(SCAN_INTERVAL_MS)
+// ...
+ESP_LOGI(TAG, "Next scan in %d seconds...", SCAN_INTERVAL_MS / 1000);
+```
+
+`SCAN_INTERVAL_MS` is the source of truth (the human-readable value). `SCAN_INTERVAL_TICKS`
+is derived from it via the standard `pdMS_TO_TICKS` macro. The print statement divides
+the original millisecond constant by 1000 — a plain integer division with no hidden
+tick-rate dependency.
+
+### Summary of Changes — Iteration 33
+
+| File | Change |
+|------|--------|
+| `patches/threadx/0001-...patch` | Patch file created + regenerated after refactoring |
+| `patches/threadx/apply.sh` | Patch apply script with upstream base commit documented |
+| `components/threadx/threadx/utility/rtos_compatibility_layers/FreeRTOS/tx_freertos.c` | `#ifdef ESP_PLATFORM` guards; `goto err` cascade in `xTaskCreate`; `#include <stdlib.h>` guard |
+| `components/freertos/threadx/include/freertos/portmacro.h` | `portTICK_PERIOD_MS` uses `configTICK_RATE_HZ` |
+| `examples/wifi_demo/main/main.c` | `SCAN_INTERVAL_MS` + `pdMS_TO_TICKS`; print uses `SCAN_INTERVAL_MS / 1000` |

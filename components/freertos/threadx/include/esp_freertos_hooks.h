@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * esp_freertos_hooks.h — Stub hooks API for ESP-IDF components that
  * register idle/tick hooks. Under ThreadX these are no-ops.

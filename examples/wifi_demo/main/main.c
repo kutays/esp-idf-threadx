@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * WiFi STA demo — connects to an access point using ThreadX as the RTOS.
  *
@@ -53,7 +54,8 @@ static void diag_timer_cb(void *arg)
 
 #define SCANNER_STACK_SIZE  4096
 #define SCANNER_PRIORITY    20      /* Lower priority than main (16) */
-#define SCAN_INTERVAL_TICKS 1500    /* 15 seconds at 100 Hz tick rate */
+#define SCAN_INTERVAL_MS    15000
+#define SCAN_INTERVAL_TICKS pdMS_TO_TICKS(SCAN_INTERVAL_MS)
 #define MAX_SCAN_RESULTS    20
 
 static TX_THREAD scanner_thread;
@@ -161,7 +163,7 @@ static void scanner_thread_entry(ULONG param)
         free(ap_records);
 
         ESP_LOGI(TAG, "[scanner] Next scan in %d seconds...",
-                 SCAN_INTERVAL_TICKS / 100);
+                 SCAN_INTERVAL_MS / 1000);
 
         /* Sleep — lets other ThreadX threads run */
         tx_thread_sleep(SCAN_INTERVAL_TICKS);

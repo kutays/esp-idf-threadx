@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # ThreadX kernel component for ESP-IDF
 #
 # Builds the ThreadX kernel from the git submodule (threadx/) plus

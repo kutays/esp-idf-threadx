@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * list.h — FreeRTOS list type definitions for ThreadX compat layer
  *

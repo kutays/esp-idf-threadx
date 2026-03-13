@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * freertos_debug.h — Stub for ESP-IDF debugging features (esp_gdbstub, panic handler)
  *

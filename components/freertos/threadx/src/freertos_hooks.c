@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * freertos_hooks.c — Stub implementations of FreeRTOS hooks
  *

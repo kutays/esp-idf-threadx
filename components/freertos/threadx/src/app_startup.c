@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * app_startup.c — ThreadX boot entry for the freertos override component.
  *

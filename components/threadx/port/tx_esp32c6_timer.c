@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * tx_esp32c6_timer.c — ESP32-C6 SYSTIMER tick for ThreadX
  *

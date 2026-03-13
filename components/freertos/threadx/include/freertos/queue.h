@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* queue.h — forwards to FreeRTOS.h which has all queue declarations */
 #ifndef QUEUE_H_WRAPPER
 #define QUEUE_H_WRAPPER

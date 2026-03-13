@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * message_buffer.h — Stub for ThreadX compat layer
  * Message buffers are stream buffers with framing. Redirect to stream_buffer.h.

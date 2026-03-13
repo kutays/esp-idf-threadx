@@ -2805,3 +2805,84 @@ WiFi scanning issue persists. This is a separate problem from the threadx_demo h
 5. Consider whether portYIELD_FROM_ISR being a no-op prevents timely ISR→thread notification
 
 ---
+
+## Bug 41 — Pre-Kernel Task Orphaning: esp_timer / WiFi Scan Never Complete
+
+**Phase**: WiFi demo — esp_timer callbacks never fire, all scan results on channel 1
+
+**Symptom**:
+- esp_timer diagnostic timer (created in `app_main`) fires zero times despite being started
+- WiFi scan #1 returns results but all APs on channel 1 only
+- Scans 2+ return 0 AP records
+- `SCAN_DONE` event never received for scans 2+
+
+**Root cause**: ESP-IDF secondary initialization (`do_secondary_init()`) runs **before**
+`esp_startup_start_app()` and therefore before `tx_kernel_enter()`. Functions registered
+via `ESP_SYSTEM_INIT_FN(..., SECONDARY, ...)` — most critically `esp_timer_init_os()` —
+call `xTaskCreate()` at this early stage, creating FreeRTOS (compat-layer) tasks.
+
+When `tx_kernel_enter()` runs later, it calls `_tx_thread_initialize()` internally.
+This function clears ThreadX's global scheduler bookkeeping:
+
+```c
+_tx_thread_created_ptr = TX_NULL;
+TX_MEMSET(_tx_thread_priority_list, 0, sizeof(_tx_thread_priority_list));
+TX_MEMSET(_tx_thread_priority_maps, 0, sizeof(_tx_thread_priority_maps));
+```
+
+These pre-kernel tasks are now **orphaned**: their `txfr_task_t` structs exist in memory
+and their stacks are allocated, but they are absent from every priority queue. When the
+esp_timer ISR calls `tx_semaphore_put(&notification_sem)` the semaphore count increments,
+but no thread ever wakes because the task was never placed in the ready list after the
+kernel clear.
+
+**Why channel 1 specifically**: The esp_timer task processes internal WiFi scan timeout
+callbacks that advance the scan from one channel to the next. Without it running, the
+hardware completes its dwell time on channel 1 and signals the driver, but the driver
+never instructs the hardware to move to channel 2. Any APs found during the channel-1
+dwell appear in the results; everything else is invisible.
+
+**Affected tasks** created by ESP-IDF secondary init (before `tx_kernel_enter()`):
+- `esp_timer` task — `esp_timer_init_os()` → `xTaskCreate("esp_timer", ...)`
+- Potentially `tiT` (IDF timer daemon), newlib lock tasks, and others per configuration
+
+**Fix**: Pre-kernel task tracking + re-registration in `tx_freertos.c`:
+
+1. **Tracking** (`xTaskCreate`): when `txfr_pre_kernel_tracking == 1u` (flag cleared only
+   in `tx_freertos_init()`), save a pointer to each created `txfr_task_t` in a static array
+   `txfr_pre_kernel_tasks[TXFR_MAX_PRE_KERNEL_TASKS]`.
+
+2. **Re-registration** (`tx_freertos_init()`, called from `tx_application_define()` after
+   `tx_kernel_enter()` completes):
+   - Read stack parameters from the still-valid TCB fields (`tx_thread_stack_start`,
+     `tx_thread_stack_size`, `tx_thread_name`, `tx_thread_priority`) — these survive
+     `_tx_thread_initialize()` because it only zeroes the global list/map arrays, not
+     individual `TX_THREAD` structs.
+   - Clear `tx_thread_id = 0` so `tx_thread_create` accepts the already-allocated TCB.
+   - Call `tx_thread_create(..., TX_DONT_START)` to re-register with the live kernel.
+   - Clear `tx_semaphore_id = 0` and call `tx_semaphore_create` to re-register the
+     notification semaphore.
+   - Call `tx_thread_resume` to put the thread back into the ready queue.
+
+3. **Guard**: All added code is wrapped in `#ifdef ESP_PLATFORM` to keep the upstream
+   compat layer portable to non-ESP targets.
+
+**Result**: esp_timer callbacks fire correctly. WiFi scan completes all channels. `SCAN_DONE`
+received. APs reported on their real channels (not stuck on channel 1). Both `wifi_demo`
+and `threadx_demo` build and run correctly.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `components/threadx/threadx/utility/rtos_compatibility_layers/FreeRTOS/tx_freertos.c` | Pre-kernel tracking globals + `xTaskCreate` tracking + `tx_freertos_init` re-registration loop |
+
+### Key Lesson
+
+ESP-IDF secondary init creates FreeRTOS tasks **before** `tx_kernel_enter()`. Any RTOS
+that replaces FreeRTOS via a compat layer must account for this: tasks created before the
+kernel starts will be orphaned when `_tx_thread_initialize()` clears the global scheduler
+tables. The fix is to snapshot those tasks before the clear and re-register them into the
+live kernel immediately after init completes.
+
+---

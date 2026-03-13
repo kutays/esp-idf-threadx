@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * tx_user.h — ThreadX configuration overrides for ESP32-C6
  *

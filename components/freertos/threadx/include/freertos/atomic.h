@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * atomic.h — FreeRTOS atomic operations stub for ThreadX compat layer
  *

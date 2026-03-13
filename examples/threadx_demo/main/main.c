@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * ThreadX on ESP32-C6 — Native ThreadX API Demo
  *

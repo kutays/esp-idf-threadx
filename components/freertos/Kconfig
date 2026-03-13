@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Kconfig stubs for CONFIG_FREERTOS_* options checked by ESP-IDF components.
 # When ThreadX is selected, these provide default values so ESP-IDF code compiles.
 # When FreeRTOS is selected, the real Kconfig from $IDF_PATH takes over

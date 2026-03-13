@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * tx_initialize_low_level.S — ESP32-C6 low-level ThreadX initialization
  *

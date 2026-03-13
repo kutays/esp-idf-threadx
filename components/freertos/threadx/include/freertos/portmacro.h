@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * portmacro.h — ESP32-C6 RISC-V + ThreadX port macros
  *
@@ -59,7 +60,7 @@ typedef uint8_t StackType_t;
  */
 
 /* Tick conversion */
-#define portTICK_PERIOD_MS      (1000 / 100)  /* configTICK_RATE_HZ = 100 */
+#define portTICK_PERIOD_MS      ((TickType_t)(1000 / configTICK_RATE_HZ))
 
 /* Stack */
 #define portBYTE_ALIGNMENT      16

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * port.c — ESP-IDF-specific supplements for the ThreadX FreeRTOS compat layer
  *

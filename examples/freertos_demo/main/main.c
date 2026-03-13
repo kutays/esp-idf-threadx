@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * FreeRTOS on ESP32-C6 — Demo Application
  *

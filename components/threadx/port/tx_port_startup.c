@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * tx_port_startup.c — ESP-IDF to ThreadX bridge
  *

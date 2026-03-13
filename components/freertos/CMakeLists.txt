@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # components/freertos/CMakeLists.txt
 #
 # Overrides ESP-IDF's built-in freertos component.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* stream_buffer.h — stub (not implemented in ThreadX compat layer) */
 #ifndef STREAM_BUFFER_H_WRAPPER
 #define STREAM_BUFFER_H_WRAPPER

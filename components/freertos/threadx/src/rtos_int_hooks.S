@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * rtos_int_hooks.S — ESP-IDF interrupt dispatch hooks for ThreadX
  *

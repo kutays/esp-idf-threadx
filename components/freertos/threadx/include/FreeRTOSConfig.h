@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * FreeRTOSConfig.h — Configuration for ThreadX FreeRTOS compatibility layer
  *

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # ThreadX on ESP32-C6 — Top-level ESP-IDF project
 cmake_minimum_required(VERSION 3.16)
 

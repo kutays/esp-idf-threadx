@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * FreeRTOS.h — Wrapper that includes the upstream ThreadX compat layer's
  * FreeRTOS.h (all type definitions and function declarations) then adds

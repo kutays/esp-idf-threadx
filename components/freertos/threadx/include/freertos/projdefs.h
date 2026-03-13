@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /* projdefs.h — minimal FreeRTOS project definitions for ESP-IDF compat */
 #ifndef PROJDEFS_H_WRAPPER
 #define PROJDEFS_H_WRAPPER
