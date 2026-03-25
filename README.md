@@ -84,7 +84,7 @@ This project has been started almost 2.5 years ago. But due to the complexities 
 porting ESP32 Xtensa and SMP patch requirement for ThreadX) switched to a single core RISCV chip. This was a perfect
 opportunity to test the potential and limitations of vibe coding on a complex maintenance / integration heavy project.
 
-Project planned as multiple phases. The first phase was to intercept FreeRTOS and boot with ThreadX. Run test threads to test. The second phase was port the WIFI stack. The this first MVP is a functional ThreadX port that boots, schedules multiple threads,
+Project planned as multiple phases. The first phase was to intercept FreeRTOS and boot with ThreadX. Run test threads to see if context switching works. The second phase was porting the WIFI stack. The first MVP is a functional ThreadX port that boots, schedules multiple threads,
 fires a 100 Hz tick, and runs the ESP32-C6 WiFi stack reached after 41 documented
 bugs across dozens of iterations.
 
